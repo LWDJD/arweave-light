@@ -1,0 +1,16 @@
+# 编译产出
+arweave-light
+*.exe
+
+# 数据目录
+/data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
