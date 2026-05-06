@@ -375,6 +375,20 @@ func (n *Node) GetChainInfo() (*types.ChainInfo, error) {
 	return n.db.GetChainInfo()
 }
 
+// FetchBlockByHeight fetches a block from the network by height (through single peer).
+func (n *Node) FetchBlockByHeight(ctx context.Context, height uint64) (*types.Block, error) {
+	return n.singlePeer.GetBlockByHeight(ctx, height)
+}
+
+// FetchNetworkHeight returns the current network height.
+func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
+	info, err := n.singlePeer.GetInfo(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return info.Height, nil
+}
+
 // GetNetworkInfo returns info from the peer network.
 func (n *Node) GetNetworkInfo(ctx context.Context) (*types.ChainInfo, error) {
 	info, err := n.mc.GetInfo(ctx)
@@ -413,6 +427,11 @@ func (n *Node) GetTxAnchor(ctx context.Context) (types.Hash, error) {
 // GetPeers returns the local peer list.
 func (n *Node) GetPeers(ctx context.Context) ([]string, error) {
 	return n.peerStore.URLs(), nil
+}
+
+// GetValidator returns the node's validator (for genesis verification, etc.).
+func (n *Node) GetValidator() *validator.Validator {
+	return n.validator
 }
 
 // ValidateTransaction validates a transaction.

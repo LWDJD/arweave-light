@@ -14,6 +14,7 @@ import (
 
 	"github.com/arweave-light/node"
 	"github.com/arweave-light/types"
+	"github.com/arweave-light/verifier"
 )
 
 var (
@@ -30,13 +31,11 @@ func main() {
 	noSync := flag.Bool("no-sync", false, "Disable automatic synchronization")
 	noValidate := flag.Bool("no-validate", false, "Disable block validation")
 
-	// New peer-discovery flags
 	bootstrap := flag.String("bootstrap", "", "Bootstrap peer URL (required on first run)")
 	addPeer := flag.String("add-peer", "", "Manually add a peer URL")
 	listPeers := flag.Bool("list-peers", false, "List all known peers and exit")
 	minConsensus := flag.Int("min-consensus", cfg.MinConsensus, "Minimum agreeing peers for consensus (default 3)")
 
-	// Query flags
 	queryBlock := flag.Uint64("block", 0, "Query a specific block by height")
 	queryTx := flag.String("tx", "", "Query a transaction by ID (base64)")
 	queryTxData := flag.String("tx-data", "", "Fetch transaction data by ID (base64)")
@@ -44,6 +43,15 @@ func main() {
 	queryStatus := flag.Bool("status", false, "Show sync status")
 	queryStats := flag.Bool("stats", false, "Show node statistics")
 	showVersion := flag.Bool("version", false, "Show version")
+
+	genesisVerify := flag.Bool("genesis-verify", false, "Run full chain verification from genesis/checkpoint")
+	genesisFrom := flag.Uint64("genesis-from", 0, "Starting height for genesis verification")
+	genesisTo := flag.Uint64("genesis-to", 0, "Ending height (default: network tip)")
+	genesisWorkers := flag.Int("genesis-workers", 4, "Number of concurrent fetch workers")
+	genesisForce := flag.Bool("genesis-force", false, "Ignore existing checkpoint, re-verify from --genesis-from")
+
+	showCheckpoint := flag.Bool("checkpoint", false, "Show current trusted checkpoint")
+	clearCheckpoint := flag.Bool("checkpoint-clear", false, "Remove trusted checkpoint")
 
 	flag.Parse()
 
@@ -61,7 +69,6 @@ func main() {
 		cfg.SyncEnabled = false
 	}
 
-	// New config fields
 	cfg.Bootstrap = strings.TrimRight(*bootstrap, "/")
 	cfg.AddPeer = strings.TrimRight(*addPeer, "/")
 	cfg.ListPeers = *listPeers
@@ -85,7 +92,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Handle --list-peers (can be combined with other queries or standalone)
 	if cfg.ListPeers {
 		fmt.Println("\n==== Known Peers ====")
 		allPeers := n.PeerStore().GetAll()
@@ -100,13 +106,68 @@ func main() {
 		fmt.Printf("Total: %d peers (max %d)\n\n", len(allPeers), 50)
 	}
 
+	if *showCheckpoint || *clearCheckpoint {
+		cpStore := verifier.NewCheckpointStore(*dataDir)
+		if *clearCheckpoint {
+			if cpStore.Exists() {
+				cpStore.Remove()
+				fmt.Println("Checkpoint cleared.")
+			} else {
+				fmt.Println("No checkpoint to clear.")
+			}
+		} else {
+			if !cpStore.Exists() {
+				fmt.Println("No trusted checkpoint found. Run --genesis-verify first.")
+			} else {
+				cp, err := cpStore.Load()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error loading checkpoint: %v\n", err)
+				} else {
+					fmt.Printf("Trusted Checkpoint:\n")
+					fmt.Printf("  Height:        %d\n", cp.Height)
+					fmt.Printf("  Indep Hash:    %s\n", cp.IndepHash)
+					fmt.Printf("  Verified:      %d blocks\n", cp.VerifiedCount)
+					fmt.Printf("  Timestamp:     %s\n", time.Unix(cp.Timestamp, 0).Format(time.RFC3339))
+				}
+			}
+		}
+		n.Stop()
+		return
+	}
+
+	if *genesisVerify {
+		cpStore := verifier.NewCheckpointStore(*dataDir)
+		val := n.GetValidator()
+		gv := verifier.NewGenesisVerifier(n.MultiClient(), cpStore, val, *genesisWorkers)
+		fmt.Printf("Starting genesis chain verification...\n")
+		fmt.Printf("  From:    height %d\n", *genesisFrom)
+		fmt.Printf("  To:      height %d (0 = network tip)\n", *genesisTo)
+		fmt.Printf("  Force:   %v\n", *genesisForce)
+		fmt.Printf("  Workers: %d\n", *genesisWorkers)
+		result, err := gv.Verify(ctx, *genesisFrom, *genesisTo, *genesisForce)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Genesis verification failed: %v\n", err)
+		} else if result.FailedReason != "" {
+			fmt.Fprintf(os.Stderr, "\nVERIFICATION FAILED at height %d: %s\n",
+				result.FailedHeight, result.FailedReason)
+		} else {
+			fmt.Printf("\nGenesis verification complete!\n")
+			fmt.Printf("   Verified:  %d blocks (%d -> %d)\n", result.VerifiedCount, result.StartHeight, result.EndHeight)
+			fmt.Printf("   Duration:  %s\n", result.Duration.Round(time.Second))
+			if result.Checkpoint != nil {
+				fmt.Printf("   Checkpoint saved at height %d\n", result.Checkpoint.Height)
+			}
+		}
+		n.Stop()
+		return
+	}
+
 	if *queryInfo || *queryBlock > 0 || *queryTx != "" || *queryTxData != "" || *queryStatus || *queryStats {
 		handleQueries(ctx, n, *queryInfo, *queryBlock, *queryTx, *queryTxData, *queryStatus, *queryStats)
 		n.Stop()
 		return
 	}
 
-	// If only --list-peers was requested and nothing else, exit
 	if cfg.ListPeers && !cfg.SyncEnabled {
 		n.Stop()
 		return

@@ -71,12 +71,12 @@ func TestMultiClientConsensus(t *testing.T) {
 	// 3 return correct block, 2 return wrong block
 	ctx := context.Background()
 
-	var failFlag atomic.Bool
-	s1 := mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
-	s2 := mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
-	s3 := mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
-	s4 := mockArweaveServer(t, 100, "wrong-hash-yyyyyyyyyyyyyyyyyy", nil)
-	s5 := mockArweaveServer(t, 100, "wrong-hash-yyyyyyyyyyyyyyyyyy", nil)
+	var s1, s2, s3, s4, s5 *httptest.Server
+	s1 = mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
+	s2 = mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
+	s3 = mockArweaveServer(t, 100, "correct-hash-xxxxxxxxxxxxxxxxxx", nil)
+	s4 = mockArweaveServer(t, 100, "wrong-hash-yyyyyyyyyyyyyyyyyy", nil)
+	s5 = mockArweaveServer(t, 100, "wrong-hash-yyyyyyyyyyyyyyyyyy", nil)
 	defer s1.Close()
 	defer s2.Close()
 	defer s3.Close()

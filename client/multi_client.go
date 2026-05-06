@@ -311,6 +311,34 @@ func (mc *MultiClient) GetTxAnchor(ctx context.Context, url string) (types.Hash,
 	return mc.getClient(url).GetTxAnchor(ctx)
 }
 
+// FetchBlockByHeight implements verifier.BlockFetcher. It returns the
+// consensus-winning block at the given height, or an error if no
+// consensus could be reached.
+func (mc *MultiClient) FetchBlockByHeight(ctx context.Context, height uint64) (*types.Block, error) {
+	cr, err := mc.GetBlockByHeight(ctx, height)
+	if err != nil {
+		return nil, err
+	}
+	if cr.Block == nil {
+		return nil, fmt.Errorf("consensus returned nil block at height %d", height)
+	}
+	return cr.Block, nil
+}
+
+// FetchNetworkHeight implements verifier.BlockFetcher. It queries the
+// best peer to find the current network height.
+func (mc *MultiClient) FetchNetworkHeight(ctx context.Context) (uint64, error) {
+	peers := mc.peerStore.Top(mc.queryCount)
+	for _, p := range peers {
+		info, err := mc.getClient(p.URL).GetInfo(ctx)
+		if err == nil {
+			return info.Height, nil
+		}
+		mc.peerStore.RecordTimeout(p.URL)
+	}
+	return 0, fmt.Errorf("no peer could provide network height")
+}
+
 // SingleClient returns an HTTPClient for a specific URL. Useful for
 // operations that don't need consensus.
 func (mc *MultiClient) SingleClient(url string) *HTTPClient {
