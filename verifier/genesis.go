@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 	"github.com/arweave-light/validator"
 )
@@ -25,6 +26,7 @@ type GenesisVerifier struct {
 	checkpoint *CheckpointStore
 	validator  *validator.Validator
 	workers    int
+	log        *logger.Logger
 }
 
 // VerifyResult contains the result of a genesis verification run.
@@ -48,6 +50,7 @@ func NewGenesisVerifier(fetcher BlockFetcher, cpStore *CheckpointStore, val *val
 		checkpoint: cpStore,
 		validator:  val,
 		workers:    workers,
+		log:        logger.NewLogger("genesis-verify"),
 	}
 }
 
@@ -63,7 +66,7 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 		}
 		if cp != nil && cp.Height >= currentHeight {
 			currentHeight = cp.Height + 1
-			log.Printf("[genesis-verify] Resuming from checkpoint at height %d", cp.Height)
+			gv.log.Info("Resuming from checkpoint at height %d", cp.Height)
 		}
 	}
 
@@ -87,7 +90,7 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 	}
 
 	totalBlocks := networkHeight - currentHeight + 1
-	log.Printf("[genesis-verify] Verifying %d blocks (height %d -> %d) with %d workers",
+	gv.log.Info("Verifying %d blocks (height %d -> %d) with %d workers",
 		totalBlocks, currentHeight, networkHeight, gv.workers)
 
 	type fetchResult struct {
@@ -131,7 +134,7 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 	var prevBlock *types.Block
 	batch := make([]fetchResult, 0, gv.workers*2)
 	nextExpected := currentHeight
-	progressTicker := time.NewTicker(5 * time.Second)
+	progressTicker := time.NewTicker(2 * time.Second)
 	defer progressTicker.Stop()
 
 	done := false
@@ -186,7 +189,7 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 							VerifiedCount: verifiedCount,
 						}
 						if err := gv.checkpoint.Save(cp); err != nil {
-							log.Printf("[genesis-verify] Warning: checkpoint save failed: %v", err)
+							gv.log.Warn("Checkpoint save failed: %v", err)
 						}
 					}
 
@@ -205,11 +208,14 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 			pct := float64(verifiedCount) / float64(totalBlocks) * 100
 			elapsed := time.Since(startTime)
 			rate := float64(verifiedCount) / elapsed.Seconds()
-			log.Printf("[genesis-verify] Progress: %d/%d (%.1f%%) | %.1f blocks/s | elapsed %s",
+			gv.log.Progress("Progress: %d/%d (%.1f%%) | %.1f blocks/s | elapsed %s",
 				verifiedCount, totalBlocks, pct, rate, elapsed.Round(time.Second))
 		default:
 		}
 	}
+
+	// Clear progress line before final output
+	fmt.Fprint(os.Stderr, "\n")
 
 	finalHash := prevBlock.IndepHash.String()
 	cp := &TrustedCheckpoint{

@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/arweave-light/client"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/node"
 	"github.com/arweave-light/types"
 	"github.com/arweave-light/verifier"
@@ -54,7 +54,31 @@ func main() {
 	showCheckpoint := flag.Bool("checkpoint", false, "Show current trusted checkpoint")
 	clearCheckpoint := flag.Bool("checkpoint-clear", false, "Remove trusted checkpoint")
 
+	verbose := flag.Bool("verbose", false, "Enable verbose (DEBUG) logging")
+	quiet := flag.Bool("quiet", false, "Suppress non-error output (only WARN and above)")
+	logFilePath := flag.String("log-file", "", "Log file path (dual stderr + file output)")
+
+	// Short forms
+	flag.BoolVar(verbose, "v", false, "Alias for --verbose")
+
 	flag.Parse()
+
+	// --- Configure logger ---
+	if *verbose {
+		logger.SetLevel(logger.DEBUG)
+	} else if *quiet {
+		logger.SetLevel(logger.WARN)
+	} else {
+		logger.SetLevel(logger.INFO)
+	}
+
+	if *logFilePath != "" {
+		if err := logger.SetLogFile(*logFilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: cannot open log file: %v\n", err)
+		}
+	}
+
+	mainLog := logger.NewLogger("main")
 
 	if *showVersion {
 		fmt.Printf("arweave-light v%s (built %s)\n", version, buildTime)
@@ -78,7 +102,7 @@ func main() {
 
 	n, err := node.New(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create node: %v", err)
+		mainLog.Fatal("Failed to create node: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -88,7 +112,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Println("Received interrupt signal")
+		mainLog.Info("Received interrupt signal")
 		cancel()
 		n.Stop()
 		os.Exit(0)
@@ -176,23 +200,23 @@ func main() {
 	}
 
 	if err := n.Start(ctx); err != nil {
-		log.Fatalf("Failed to start node: %v", err)
+		mainLog.Fatal("Failed to start node: %v", err)
 	}
 
-	log.Println("arweave-light is running. Press Ctrl+C to stop.")
+	mainLog.Info("arweave-light is running. Press Ctrl+C to stop.")
 	for evt := range n.Events() {
 		switch evt.Type {
 		case node.EventBlock:
 			if block, ok := evt.Data.(*types.Block); ok {
-				log.Printf("[event] New block: height=%d hash=%s txs=%d",
+				mainLog.Info("[event] New block: height=%d hash=%s txs=%d",
 					block.Height, block.Hash.String()[:16], len(block.Txs))
 			}
 		case node.EventSyncComplete:
-			log.Printf("[event] Sync complete at height %v", evt.Data)
+			mainLog.Info("[event] Sync complete at height %v", evt.Data)
 		case node.EventError:
-			log.Printf("[event] Error: %v", evt.Data)
+			mainLog.Error("[event] Error: %v", evt.Data)
 		case node.EventFork:
-			log.Printf("[event] Fork detected at height %v", evt.Data)
+			mainLog.Warn("[event] Fork detected at height %v", evt.Data)
 		}
 	}
 

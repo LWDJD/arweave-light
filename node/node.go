@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/arweave-light/client"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/peers"
 	"github.com/arweave-light/store"
 	"github.com/arweave-light/syncer"
@@ -53,6 +53,7 @@ func DefaultConfig() Config {
 // Node is the main coordinator.
 type Node struct {
 	cfg        Config
+	log        *logger.Logger
 	db         *store.DB
 	peerStore  *peers.Store
 	mc         *client.MultiClient
@@ -91,6 +92,7 @@ const (
 func New(cfg Config) (*Node, error) {
 	n := &Node{
 		cfg:            cfg,
+		log:            logger.NewLogger("node"),
 		eventCh:        make(chan Event, 1000),
 		checkpointPath: filepath.Join(cfg.DataDir, "checkpoint.json"),
 	}
@@ -105,6 +107,7 @@ func New(cfg Config) (*Node, error) {
 	// Init peer store
 	peersPath := filepath.Join(cfg.DataDir, "peers.json")
 	n.peerStore = peers.NewStore(peersPath)
+	n.peerStore.SetLogger(logger.NewLogger("peers"))
 
 	// Keep single-peer client for fallback queries (height-only, no data trust)
 	n.singlePeer = client.NewHTTPClient(cfg.PeerURL, cfg.HTTPTimeout)
@@ -118,6 +121,7 @@ func New(cfg Config) (*Node, error) {
 		minC = 1
 	}
 	n.mc = client.NewMultiClient(n.peerStore, minC, cfg.HTTPTimeout)
+	n.mc.SetLogger(logger.NewLogger("multiclient"))
 
 	if cfg.ValidateBlocks {
 		n.validator = validator.NewValidator()
@@ -138,13 +142,13 @@ func (n *Node) Start(ctx context.Context) error {
 	ctx, n.cancelFn = context.WithCancel(ctx)
 	n.mu.Unlock()
 
-	log.Printf("[node] Starting arweave-light (pure decentralized sync)")
-	log.Printf("[node] Data directory: %s", n.cfg.DataDir)
-	log.Printf("[node] Consensus mode: %v (min %d peers)", n.cfg.Consensus, n.cfg.MinConsensus)
+	n.log.Info("Starting arweave-light (pure decentralized sync)")
+	n.log.Info("Data directory: %s", n.cfg.DataDir)
+	n.log.Info("Consensus mode: %v (min %d peers)", n.cfg.Consensus, n.cfg.MinConsensus)
 
 	// ---- Peer discovery lifecycle ----
 	if err := n.peerDiscovery(ctx); err != nil {
-		log.Printf("[node] WARNING: peer discovery: %v", err)
+		n.log.Warn("Peer discovery: %v", err)
 	}
 
 	// ---- Print peer list if requested ----
@@ -156,21 +160,21 @@ func (n *Node) Start(ctx context.Context) error {
 	if n.cfg.AddPeer != "" {
 		n.peerStore.Add(n.cfg.AddPeer)
 		if err := n.peerStore.Save(); err != nil {
-			log.Printf("[node] Failed to save peers: %v", err)
+			n.log.Warn("Failed to save peers: %v", err)
 		}
-		log.Printf("[node] Manually added peer: %s", n.cfg.AddPeer)
+		n.log.Info("Manually added peer: %s", n.cfg.AddPeer)
 	}
 
 	// Check connectivity to best peers
 	topPeers := n.peerStore.Top(5)
 	if len(topPeers) > 0 {
-		log.Printf("[node] Testing connectivity to top %d peers...", len(topPeers))
+		n.log.Info("Testing connectivity to top %d peers...", len(topPeers))
 		for _, p := range topPeers {
 			if err := n.mc.Ping(ctx, p.URL); err != nil {
-				log.Printf("[node]   %s → unreachable: %v", p.URL, err)
+				n.log.Warn("  %s → unreachable: %v", p.URL, err)
 				n.peerStore.RecordTimeout(p.URL)
 			} else {
-				log.Printf("[node]   %s → OK (score=%d)", p.URL, p.Score)
+				n.log.Info("  %s → OK (score=%d)", p.URL, p.Score)
 				n.peerStore.RecordSuccess(p.URL)
 			}
 		}
@@ -180,14 +184,14 @@ func (n *Node) Start(ctx context.Context) error {
 	// ---- Load persisted checkpoint ----
 	cp := n.loadCheckpoint()
 	if cp != nil {
-		log.Printf("[node] Loaded checkpoint: height=%d indep_hash=%s",
+		n.log.Info("Loaded checkpoint: height=%d indep_hash=%s",
 			cp.Height, cp.IndepHash.String()[:16])
 	}
 
 	// Get network info for display
 	netHeight, err := n.fetchNetworkHeight(ctx)
 	if err != nil {
-		log.Printf("[node] WARNING: cannot get network height: %v", err)
+		n.log.Warn("Cannot get network height: %v", err)
 	} else {
 		localInfo, _ := n.db.GetChainInfo()
 		localH := uint64(0)
@@ -197,7 +201,7 @@ func (n *Node) Start(ctx context.Context) error {
 		if cp != nil {
 			localH = cp.Height
 		}
-		log.Printf("[node] Network height: %d, local checkpoint: %d", netHeight, localH)
+		n.log.Info("Network height: %d, local checkpoint: %d", netHeight, localH)
 	}
 
 	// ---- Start syncer ----
@@ -217,7 +221,7 @@ func (n *Node) Start(ctx context.Context) error {
 		go func() {
 			if err := n.syncer.SyncToTip(ctx); err != nil {
 				if !errors.Is(err, context.Canceled) {
-					log.Printf("[node] Sync error: %v", err)
+					n.log.Error("Sync error: %v", err)
 					n.emitEvent(EventError, err.Error())
 				}
 			}
@@ -240,7 +244,7 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 		return n.bootstrap(ctx)
 	}
 
-	log.Printf("[node] Loaded %d peers from %s", n.peerStore.Len(),
+	n.log.Info("Loaded %d peers from %s", n.peerStore.Len(),
 		filepath.Join(n.cfg.DataDir, "peers.json"))
 	return nil
 }
@@ -256,7 +260,7 @@ func (n *Node) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("no bootstrap peer configured (use --bootstrap)")
 	}
 
-	log.Printf("[node] First run: bootstrapping from %s", bootstrapURL)
+	n.log.Info("First run: bootstrapping from %s", bootstrapURL)
 
 	n.peerStore.Add(bootstrapURL)
 	n.peerStore.RecordSuccess(bootstrapURL)
@@ -264,13 +268,13 @@ func (n *Node) bootstrap(ctx context.Context) error {
 	bootstrapClient := client.NewHTTPClient(bootstrapURL, n.cfg.HTTPTimeout)
 	peerURLs, err := bootstrapClient.GetPeers(ctx)
 	if err != nil {
-		log.Printf("[node] Failed to get peers from bootstrap: %v", err)
+		n.log.Warn("Failed to get peers from bootstrap: %v", err)
 		return n.peerStore.Save()
 	}
 
-	log.Printf("[node] Bootstrap returned %d peers", len(peerURLs))
+	n.log.Info("Bootstrap returned %d peers", len(peerURLs))
 	added := n.peerStore.AddPeers(peerURLs)
-	log.Printf("[node] Added %d new peers (total: %d)", added, n.peerStore.Len())
+	n.log.Info("Added %d new peers (total: %d)", added, n.peerStore.Len())
 
 	return n.peerStore.Save()
 }
@@ -285,18 +289,18 @@ func (n *Node) peerRefreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			log.Printf("[node] Refreshing peer list...")
+			n.log.Info("Refreshing peer list...")
 			newURLs, err := n.mc.GetPeersFromAll(ctx)
 			if err != nil {
-				log.Printf("[node] Peer refresh failed: %v", err)
+				n.log.Warn("Peer refresh failed: %v", err)
 				continue
 			}
 			added := n.peerStore.AddPeers(newURLs)
 			if added > 0 {
-				log.Printf("[node] Peer refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
+				n.log.Info("Peer refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
 				n.peerStore.Save()
 			} else {
-				log.Printf("[node] Peer refresh: no new peers found")
+				n.log.Info("Peer refresh: no new peers found")
 			}
 		}
 	}
@@ -304,13 +308,13 @@ func (n *Node) peerRefreshLoop(ctx context.Context) {
 
 func (n *Node) printPeers() {
 	all := n.peerStore.GetAll()
-	log.Printf("[node] ---- Peer List (%d) ----", len(all))
+	n.log.Info("---- Peer List (%d) ----", len(all))
 	for i, p := range all {
-		log.Printf("  %2d. %s  score=%d  success=%d  fail=%d  last=%s",
+		n.log.Info("  %2d. %s  score=%d  success=%d  fail=%d  last=%s",
 			i+1, p.URL, p.Score, p.SuccessCount, p.FailCount,
 			p.LastConnected.Format("2006-01-02 15:04:05"))
 	}
-	log.Printf("[node] -------------------------")
+	n.log.Info("-------------------------")
 }
 
 // Stop gracefully shuts down the node.
@@ -326,14 +330,14 @@ func (n *Node) Stop() error {
 	}
 	n.mu.Unlock()
 
-	log.Printf("[node] Shutting down...")
+	n.log.Info("Shutting down...")
 
 	if n.syncer != nil {
 		n.syncer.Cancel()
 	}
 
 	if err := n.peerStore.Save(); err != nil {
-		log.Printf("[node] Failed to save peers: %v", err)
+		n.log.Warn("Failed to save peers: %v", err)
 	}
 
 	if err := n.db.Close(); err != nil {
@@ -341,7 +345,7 @@ func (n *Node) Stop() error {
 	}
 
 	close(n.eventCh)
-	log.Printf("[node] Node stopped")
+	n.log.Info("Node stopped")
 	return nil
 }
 
@@ -566,16 +570,16 @@ func (n *Node) saveCheckpoint(cp *syncer.TrustedCheckpoint) {
 	}
 	data, err := json.MarshalIndent(cf, "", "  ")
 	if err != nil {
-		log.Printf("[node] Failed to marshal checkpoint: %v", err)
+		n.log.Warn("Failed to marshal checkpoint: %v", err)
 		return
 	}
 	tmpPath := n.checkpointPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		log.Printf("[node] Failed to write checkpoint: %v", err)
+		n.log.Warn("Failed to write checkpoint: %v", err)
 		return
 	}
 	if err := os.Rename(tmpPath, n.checkpointPath); err != nil {
-		log.Printf("[node] Failed to rename checkpoint: %v", err)
+		n.log.Warn("Failed to rename checkpoint: %v", err)
 		return
 	}
 }

@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/peers"
 	"github.com/arweave-light/types"
 )
@@ -18,9 +18,10 @@ type MultiClient struct {
 	minConsensus int
 	timeout      time.Duration
 	queryCount   int // how many peers to query per request
+	log          *logger.Logger
 
-	mu        sync.Mutex
-	clients   map[string]*HTTPClient // URL → client cache
+	mu      sync.Mutex
+	clients map[string]*HTTPClient // URL → client cache
 }
 
 // NewMultiClient creates a MultiClient backed by a peer store.
@@ -34,7 +35,13 @@ func NewMultiClient(ps *peers.Store, minConsensus int, timeout time.Duration) *M
 		timeout:      timeout,
 		queryCount:   max(minConsensus*2, 5),
 		clients:      make(map[string]*HTTPClient),
+		log:          logger.NewLogger("multiclient"),
 	}
+}
+
+// SetLogger sets the logger for this multi-client.
+func (mc *MultiClient) SetLogger(l *logger.Logger) {
+	mc.log = l
 }
 
 // SetMinConsensus updates the consensus threshold.
@@ -104,7 +111,7 @@ func (mc *MultiClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 		r := <-results
 		allURLs = append(allURLs, r.url)
 		if r.err != nil {
-			log.Printf("[multiclient] Peer %s error: %v", r.url, r.err)
+			mc.log.Warn("Peer %s error: %v", r.url, r.err)
 			mc.peerStore.RecordTimeout(r.url)
 			continue
 		}
@@ -136,7 +143,7 @@ func (mc *MultiClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 			// Properly decode the consensus hash from its base64url representation
 			var h types.Hash
 			if err := h.UnmarshalJSON([]byte(`"` + key.hash + `"`)); err != nil {
-				log.Printf("[multiclient] Failed to decode consensus hash %q: %v", key.hash, err)
+				mc.log.Warn("Failed to decode consensus hash %q: %v", key.hash, err)
 				continue
 			}
 
@@ -189,7 +196,7 @@ func (mc *MultiClient) GetBlockByHeight(ctx context.Context, height uint64) (*ty
 	for i := 0; i < len(peers); i++ {
 		r := <-results
 		if r.err != nil {
-			log.Printf("[multiclient] Peer %s error on block %d: %v", r.url, height, r.err)
+			mc.log.Warn("Peer %s error on block %d: %v", r.url, height, r.err)
 			mc.peerStore.RecordTimeout(r.url)
 			continue
 		}
@@ -283,7 +290,7 @@ func (mc *MultiClient) GetPeersFromAll(ctx context.Context) ([]string, error) {
 			defer wg.Done()
 			list, err := mc.getClient(url).GetPeers(childCtx)
 			if err != nil {
-				log.Printf("[multiclient] Failed to get peers from %s: %v", url, err)
+				mc.log.Warn("Failed to get peers from %s: %v", url, err)
 				mc.peerStore.RecordTimeout(url)
 				return
 			}

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 )
 
@@ -50,6 +51,7 @@ type Store struct {
 	path     string
 	peers    types.PeerList
 	urlIndex map[string]*types.Peer
+	log      *logger.Logger
 }
 
 // NewStore creates a new peer store backed by the given file path.
@@ -59,6 +61,13 @@ func NewStore(path string) *Store {
 		peers:    make(types.PeerList, 0),
 		urlIndex: make(map[string]*types.Peer),
 	}
+}
+
+// SetLogger sets the logger for this peer store.
+func (s *Store) SetLogger(l *logger.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log = l
 }
 
 // Load reads peers from the JSON file. If the file does not exist it is not an error.
@@ -149,6 +158,11 @@ func (s *Store) Add(rawURL string) (*types.Peer, bool) {
 	s.peers = append(s.peers, p)
 	s.urlIndex[url] = p
 	s.enforceLimitLocked()
+
+	if s.log != nil {
+		s.log.Info("Peer connected: %s", url)
+	}
+
 	return p, true
 }
 
@@ -178,6 +192,9 @@ func (s *Store) Remove(url string) bool {
 	for i, p := range s.peers {
 		if p.URL == url {
 			s.peers = append(s.peers[:i], s.peers[i+1:]...)
+			if s.log != nil {
+				s.log.Info("Peer disconnected: %s", url)
+			}
 			return true
 		}
 	}
@@ -253,11 +270,17 @@ func (s *Store) RecordSuccess(url string) {
 // RecordMismatch decrements score by ScoreMismatch.
 func (s *Store) RecordMismatch(url string) {
 	s.UpdateScore(url, ScoreMismatch, false)
+	if s.log != nil {
+		s.log.Warn("Peer data mismatch: %s", url)
+	}
 }
 
 // RecordTimeout decrements score by ScoreTimeout.
 func (s *Store) RecordTimeout(url string) {
 	s.UpdateScore(url, ScoreTimeout, false)
+	if s.log != nil {
+		s.log.Warn("Peer timeout: %s", url)
+	}
 }
 
 // URLs returns a string slice of all peer URLs.
@@ -284,6 +307,8 @@ func (s *Store) enforceLimitLocked() {
 		url := s.peers[worst].URL
 		delete(s.urlIndex, url)
 		s.peers = append(s.peers[:worst], s.peers[worst+1:]...)
+		if s.log != nil {
+			s.log.Warn("Peer evicted due to max peer limit: %s", url)
+		}
 	}
 }
-

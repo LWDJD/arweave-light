@@ -12,12 +12,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/arweave-light/client"
 	"github.com/arweave-light/consensus"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/store"
 	"github.com/arweave-light/types"
 	"github.com/arweave-light/validator"
@@ -65,6 +65,7 @@ type Syncer struct {
 	validator *validator.Validator
 	voter     *consensus.Voter
 	cfg       Config
+	log       *logger.Logger
 
 	mu          sync.Mutex
 	syncing     bool
@@ -90,6 +91,7 @@ func NewSyncer(db *store.DB, mc *client.MultiClient, sp *client.HTTPClient, val 
 		validator: val,
 		voter:     consensus.NewVoter(mc, mc.MinConsensus()),
 		cfg:       cfg,
+		log:       logger.NewLogger("syncer"),
 	}
 }
 
@@ -157,7 +159,7 @@ func (s *Syncer) SyncToTip(ctx context.Context) error {
 
 	// ---- Phase 1: Bootstrap checkpoint if needed ----
 	if s.checkpoint == nil {
-		log.Printf("[syncer] No trusted checkpoint — bootstrapping from network")
+		s.log.Info("No trusted checkpoint — bootstrapping from network")
 		if err := s.bootstrapCheckpoint(ctx); err != nil {
 			return fmt.Errorf("bootstrap checkpoint: %w", err)
 		}
@@ -183,7 +185,7 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 	if s.cfg.ConsensusMode && s.mc.PeerStore().Len() > 0 {
 		block, err = s.voter.VoteLatestBlock(ctx)
 		if err != nil {
-			log.Printf("[syncer] Consensus bootstrap failed: %v — falling back to single peer", err)
+			s.log.Warn("Consensus bootstrap failed: %v — falling back to single peer", err)
 			// Fall through to single-peer
 		}
 	}
@@ -198,7 +200,7 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("single-peer get block %d: %w", info.Height, err)
 		}
-		log.Printf("[syncer] Bootstrap via single peer: height=%d indep_hash=%s",
+		s.log.Info("Bootstrap via single peer: height=%d indep_hash=%s",
 			block.Height, block.IndepHash.String()[:16])
 	}
 
@@ -226,7 +228,7 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 	s.setCheckpoint(cp)
 	s.addToHeaderCache(block)
 
-	log.Printf("[syncer] Trusted checkpoint established at height %d, indep_hash=%s",
+	s.log.Info("Trusted checkpoint established at height %d, indep_hash=%s",
 		cp.Height, cp.IndepHash.String()[:16])
 
 	if s.onBlockDownloaded != nil {
@@ -254,8 +256,10 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("[syncer] Catching up: %d -> %d (%d blocks)", currentHeight, targetHeight, targetHeight-currentHeight)
+	s.log.Info("Catching up: %d -> %d (%d blocks)", currentHeight, targetHeight, targetHeight-currentHeight)
 	s.updateStatus(true, currentHeight, targetHeight)
+
+	totalToSync := targetHeight - currentHeight
 
 	for h := currentHeight + 1; h <= targetHeight; h++ {
 		select {
@@ -271,6 +275,9 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 		// Update status every 10 blocks
 		if h%10 == 0 {
 			s.updateStatus(true, h, targetHeight)
+			synced := h - currentHeight
+			s.log.Progress("Sync progress: %d/%d blocks (height %d/%d)",
+				synced, totalToSync, h, targetHeight)
 		}
 
 		// Brief pause to avoid hammering peers
@@ -282,7 +289,7 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 	}
 
 	s.updateStatus(false, targetHeight, targetHeight)
-	log.Printf("[syncer] Caught up to height %d", targetHeight)
+	s.log.Info("Caught up to height %d", targetHeight)
 
 	if s.onSyncComplete != nil {
 		s.onSyncComplete(targetHeight)
@@ -306,7 +313,7 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 	if s.cfg.ConsensusMode && s.mc.PeerStore().Len() > 0 {
 		cr, crErr := s.mc.GetBlockByHeight(ctx, height)
 		if crErr != nil {
-			log.Printf("[syncer] Consensus fetch block %d failed: %v — trying single peer", height, crErr)
+			s.log.Warn("Consensus fetch block %d failed: %v — trying single peer", height, crErr)
 		} else {
 			block = cr.Block
 		}
@@ -351,7 +358,7 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 
 	// 4. Verify timestamp reasonableness
 	if err := s.validateTimestamp(block); err != nil {
-		log.Printf("[syncer] Warning: block %d timestamp suspicious: %v", height, err)
+		s.log.Warn("Block %d timestamp suspicious: %v", height, err)
 		// Non-fatal: timestamp checks are advisory
 	}
 
@@ -393,7 +400,7 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 
 			targetHeight, err := s.fetchNetworkHeight(ctx)
 			if err != nil {
-				log.Printf("[syncer] Poll: failed to get network height: %v", err)
+				s.log.Warn("Poll: failed to get network height: %v", err)
 				continue
 			}
 
@@ -401,12 +408,12 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 				continue
 			}
 
-			log.Printf("[syncer] Poll: new blocks %d -> %d", cp.Height, targetHeight)
+			s.log.Info("Poll: new blocks %d -> %d", cp.Height, targetHeight)
 			s.updateStatus(true, cp.Height, targetHeight)
 
 			for h := cp.Height + 1; h <= targetHeight; h++ {
 				if err := s.verifyAndStoreBlock(ctx, h); err != nil {
-					log.Printf("[syncer] Poll sync error at height %d: %v", h, err)
+					s.log.Error("Poll sync error at height %d: %v", h, err)
 					break
 				}
 			}
@@ -425,7 +432,7 @@ func (s *Syncer) fetchNetworkHeight(ctx context.Context) (uint64, error) {
 		if err == nil {
 			return info.Height, nil
 		}
-		log.Printf("[syncer] Consensus GetInfo failed: %v — falling back to single peer", err)
+		s.log.Warn("Consensus GetInfo failed: %v — falling back to single peer", err)
 	}
 
 	info, err := s.sp.GetInfo(ctx)
@@ -457,7 +464,7 @@ func (s *Syncer) validateTimestamp(block *types.Block) error {
 	// This is loose — we only check for clearly bogus values
 	if block.Timestamp < now-7200 && block.Height > s.Checkpoint().Height {
 		// Only warn if we're syncing recent blocks
-		log.Printf("[syncer] Block %d timestamp %d is >2h old (now=%d)", block.Height, block.Timestamp, now)
+		s.log.Warn("Block %d timestamp %d is >2h old (now=%d)", block.Height, block.Timestamp, now)
 	}
 	return nil
 }
@@ -525,7 +532,7 @@ func (s *Syncer) SyncTransaction(ctx context.Context, txID types.Hash) (*types.T
 	}
 
 	if err := s.db.PutTransaction(tx); err != nil {
-		log.Printf("[syncer] Failed to store tx %s: %v", txID, err)
+		s.log.Warn("Failed to store tx %s: %v", txID, err)
 	}
 
 	return tx, nil

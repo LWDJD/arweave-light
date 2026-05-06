@@ -5,9 +5,9 @@ package consensus
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/arweave-light/client"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 )
 
@@ -15,6 +15,7 @@ import (
 type Voter struct {
 	mc           *client.MultiClient
 	minConsensus int
+	log          *logger.Logger
 }
 
 // NewVoter creates a consensus voter backed by a MultiClient.
@@ -25,6 +26,7 @@ func NewVoter(mc *client.MultiClient, minConsensus int) *Voter {
 	return &Voter{
 		mc:           mc,
 		minConsensus: minConsensus,
+		log:          logger.NewLogger("consensus"),
 	}
 }
 
@@ -40,7 +42,7 @@ func (v *Voter) VoteLatestBlock(ctx context.Context) (*types.Block, error) {
 	}
 	height := info.Height
 
-	log.Printf("[consensus] Network height=%d via %d peers; voting on latest block...",
+	v.log.Debug("Network height=%d via %d peers; voting on latest block...",
 		height, v.minConsensus)
 
 	// 2. Fetch the latest block via multi-peer consensus
@@ -54,7 +56,7 @@ func (v *Voter) VoteLatestBlock(ctx context.Context) (*types.Block, error) {
 			height, cr.Agreed, cr.Total, v.minConsensus)
 	}
 
-	log.Printf("[consensus] Latest block %d: %d/%d peers agree, indep_hash=%s",
+	v.log.Info("Latest block %d: %d/%d peers agree, indep_hash=%s",
 		height, cr.Agreed, cr.Total, cr.Block.IndepHash.String()[:16])
 
 	return cr.Block, nil
