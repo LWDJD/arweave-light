@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"sync"
@@ -127,9 +128,16 @@ func (mc *MultiClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 				}
 			}
 
+			// Properly decode the consensus hash from its base64url representation
+			var h types.Hash
+			if err := h.UnmarshalJSON([]byte(`"` + key.hash + `"`)); err != nil {
+				log.Printf("[multiclient] Failed to decode consensus hash %q: %v", key.hash, err)
+				continue
+			}
+
 			return &types.ChainInfo{
 				Height:      key.height,
-				CurrentHash: types.HashFromBytes([]byte(key.hash)[:32]), // placeholder
+				CurrentHash: h,
 			}, nil
 		}
 	}
@@ -276,7 +284,8 @@ func (mc *MultiClient) GetPeersFromAll(ctx context.Context) ([]string, error) {
 			}
 			mu.Lock()
 			for _, u := range list {
-				allURLs[trimTrailingSlash(u)] = true
+				// Normalize peer URLs (add http:// if missing)
+				allURLs[NormalizePeerURL(u)] = true
 			}
 			mu.Unlock()
 			mc.peerStore.RecordSuccess(url)
@@ -345,11 +354,15 @@ func (mc *MultiClient) SingleClient(url string) *HTTPClient {
 	return mc.getClient(url)
 }
 
-func trimTrailingSlash(s string) string {
-	for len(s) > 0 && s[len(s)-1] == '/' {
-		s = s[:len(s)-1]
+// DecodeHashFromBase64 decodes a base64url-encoded hash string into a Hash.
+// This is the correct way to decode hash strings, as opposed to treating the
+// ASCII bytes of the string as the hash data.
+func DecodeHashFromBase64(encoded string) (types.Hash, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return types.EmptyHash(), fmt.Errorf("decode base64url hash: %w", err)
 	}
-	return s
+	return types.HashFromBytes(decoded), nil
 }
 
 func max(a, b int) int {

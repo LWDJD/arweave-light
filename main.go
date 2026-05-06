@@ -8,10 +8,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/arweave-light/client"
 	"github.com/arweave-light/node"
 	"github.com/arweave-light/types"
 	"github.com/arweave-light/verifier"
@@ -61,7 +61,7 @@ func main() {
 	}
 
 	cfg.DataDir = *dataDir
-	cfg.PeerURL = strings.TrimRight(*peerURL, "/")
+	cfg.PeerURL = client.NormalizePeerURL(*peerURL)
 	cfg.HTTPTimeout = time.Duration(*timeout) * time.Second
 	cfg.ValidateBlocks = !*noValidate
 
@@ -69,8 +69,8 @@ func main() {
 		cfg.SyncEnabled = false
 	}
 
-	cfg.Bootstrap = strings.TrimRight(*bootstrap, "/")
-	cfg.AddPeer = strings.TrimRight(*addPeer, "/")
+	cfg.Bootstrap = client.NormalizePeerURL(*bootstrap)
+	cfg.AddPeer = client.NormalizePeerURL(*addPeer)
 	cfg.ListPeers = *listPeers
 	cfg.MinConsensus = *minConsensus
 
@@ -209,13 +209,18 @@ func handleQueries(ctx context.Context, n *node.Node, info bool, blockHeight uin
 	}
 
 	if blockHeight > 0 {
-		block, err := n.GetBlockByHeight(blockHeight)
+		// Fetch block from network first, fall back to local DB
+		block, err := n.FetchBlockByHeight(ctx, blockHeight)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Block %d not found\n", blockHeight)
-		} else {
-			data, _ := json.MarshalIndent(block, "", "  ")
-			fmt.Println(string(data))
+			// Try local DB as fallback
+			block, err = n.GetBlockByHeight(blockHeight)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Block %d not found\n", blockHeight)
+				return
+			}
 		}
+		data, _ := json.MarshalIndent(block, "", "  ")
+		fmt.Println(string(data))
 	}
 
 	if txID != "" {

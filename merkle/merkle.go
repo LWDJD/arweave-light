@@ -30,6 +30,16 @@ var (
 	ErrInvalidIndex      = errors.New("merkle: index out of range")
 )
 
+// hashConcat returns SHA-256(left || right) as a types.Hash (48 bytes,
+// with the 32-byte digest in the first 32 bytes).
+func hashConcat(left, right types.Hash) types.Hash {
+	combined := make([]byte, 0, types.HashSize*2)
+	combined = append(combined, left[:]...)
+	combined = append(combined, right[:]...)
+	sum := sha256.Sum256(combined)
+	return types.HashFromBytes(sum[:])
+}
+
 // BuildTree constructs a balanced binary Merkle tree from data items.
 func BuildTree(data [][]byte) (*Tree, error) {
 	if len(data) == 0 {
@@ -74,12 +84,7 @@ func buildRecursive(hashes []types.Hash) *Node {
 	left := buildRecursive(padded[:mid])
 	right := buildRecursive(padded[mid:])
 
-	combined := make([]byte, 0, 64)
-	combined = append(combined, left.Hash[:]...)
-	combined = append(combined, right.Hash[:]...)
-	h := sha256.Sum256(combined)
-
-	return &Node{Hash: h, Left: left, Right: right}
+	return &Node{Hash: hashConcat(left.Hash, right.Hash), Left: left, Right: right}
 }
 
 func nextPowerOfTwo(n int) int {
@@ -111,9 +116,7 @@ func ComputeRootHash(data [][]byte) (types.Hash, error) {
 		}
 		next := make([]types.Hash, len(hashes)/2)
 		for i := 0; i < len(hashes); i += 2 {
-			combined := append([]byte{}, hashes[i][:]...)
-			combined = append(combined, hashes[i+1][:]...)
-			next[i/2] = sha256.Sum256(combined)
+			next[i/2] = hashConcat(hashes[i], hashes[i+1])
 		}
 		hashes = next
 	}
@@ -165,9 +168,7 @@ func (t *Tree) GenerateProof(index int) (*Proof, error) {
 
 		next := make([]types.Hash, n/2)
 		for i := 0; i < n; i += 2 {
-			combined := append([]byte{}, layer[i][:]...)
-			combined = append(combined, layer[i+1][:]...)
-			next[i/2] = sha256.Sum256(combined)
+			next[i/2] = hashConcat(layer[i], layer[i+1])
 		}
 		layer = next
 		currentIdx = currentIdx / 2
@@ -185,15 +186,11 @@ func (t *Tree) GenerateProof(index int) (*Proof, error) {
 func VerifyProof(proof *Proof) bool {
 	current := proof.Leaf
 	for _, e := range proof.Elements {
-		var combined []byte
 		if e.IsRight {
-			combined = append(combined, current[:]...)
-			combined = append(combined, e.Hash[:]...)
+			current = hashConcat(current, e.Hash)
 		} else {
-			combined = append(combined, e.Hash[:]...)
-			combined = append(combined, current[:]...)
+			current = hashConcat(e.Hash, current)
 		}
-		current = sha256.Sum256(combined)
 	}
 	return current == proof.RootHash
 }

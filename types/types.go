@@ -9,8 +9,18 @@ import (
 	"time"
 )
 
-// Hash is a 32-byte SHA-256 hash used throughout Arweave.
-type Hash [32]byte
+// HashSize is the Arweave native hash size in bytes (see ar.hrl: -define(HASH_SIZE, 48)).
+const HashSize = 48
+
+// Hash is a 48-byte hash used throughout Arweave for block hashes,
+// indep_hash, tx_root, wallet_list, etc.
+//
+// Transaction IDs are SHA-256 (32 bytes). To accommodate both, the Hash
+// type uses a 48-byte backing array. For 32-byte values the trailing
+// 16 bytes are zero. Base64() / MarshalJSON() automatically encode
+// only the significant bytes (43 chars for 32-byte TXIDs, 64 chars
+// for full 48-byte block hashes).
+type Hash [HashSize]byte
 
 // EmptyHash returns a zero-value hash.
 func EmptyHash() Hash {
@@ -18,17 +28,42 @@ func EmptyHash() Hash {
 }
 
 // HashFromBytes creates a Hash from a byte slice.
+//   - 48 bytes      → copied directly
+//   - 32 bytes      → placed in first 32 bytes, last 16 zeroed
+//   - anything else → SHA-256 hashed (32 bytes → stored in first 32)
 func HashFromBytes(data []byte) Hash {
-	if len(data) == 32 {
-		var h Hash
+	var h Hash
+	switch len(data) {
+	case HashSize:
 		copy(h[:], data)
-		return h
+	case 32:
+		copy(h[:32], data)
+	default:
+		sum := sha256.Sum256(data)
+		copy(h[:32], sum[:])
 	}
-	return sha256.Sum256(data)
+	return h
+}
+
+// HashFromBytes48 creates a 48-byte Hash, copying data directly.
+// Panics if len(data) != 48.
+func HashFromBytes48(data []byte) Hash {
+	if len(data) != HashSize {
+		panic(fmt.Sprintf("HashFromBytes48: expected 48 bytes, got %d", len(data)))
+	}
+	var h Hash
+	copy(h[:], data)
+	return h
 }
 
 // Base64 returns the URL-safe base64 encoding (no padding).
+// It encodes only the significant bytes: 32 bytes for TXIDs
+// (trailing 16 bytes zero) and 48 bytes for block hashes.
 func (h Hash) Base64() string {
+	if h.is32() {
+		// Transaction ID or other SHA-256 value.
+		return base64.RawURLEncoding.EncodeToString(h[:32])
+	}
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
@@ -37,25 +72,47 @@ func (h Hash) String() string {
 	return h.Base64()
 }
 
+// is32 reports whether the hash is a 32-byte value (last 16 bytes are all zero).
+func (h Hash) is32() bool {
+	for i := 32; i < HashSize; i++ {
+		if h[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // MarshalJSON implements json.Marshaler.
 func (h Hash) MarshalJSON() ([]byte, error) {
 	return json.Marshal(h.Base64())
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
+// Accepts both 32-byte (43-char base64url) and 48-byte (64-char base64url)
+// encoded strings. An empty string is treated as the zero hash.
 func (h *Hash) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
+	// Empty string → zero hash
+	if s == "" {
+		*h = EmptyHash()
+		return nil
+	}
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return err
+		return fmt.Errorf("decode base64url hash: %w", err)
 	}
-	if len(b) != 32 {
-		return fmt.Errorf("invalid hash length: %d", len(b))
+	switch len(b) {
+	case HashSize:
+		copy(h[:], b)
+	case 32:
+		copy(h[:32], b)
+		// last 16 bytes remain zero (already zeroed by default)
+	default:
+		return fmt.Errorf("invalid hash length: %d (expected 32 or %d)", len(b), HashSize)
 	}
-	copy(h[:], b)
 	return nil
 }
 
@@ -92,7 +149,10 @@ func (tx *Transaction) ComputeID() error {
 	if err != nil {
 		return fmt.Errorf("decode signature: %w", err)
 	}
-	tx.ComputedID = sha256.Sum256(sigBytes)
+	sum := sha256.Sum256(sigBytes)
+	var h Hash
+	copy(h[:32], sum[:])
+	tx.ComputedID = h
 	return nil
 }
 

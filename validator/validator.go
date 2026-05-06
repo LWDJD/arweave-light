@@ -213,7 +213,8 @@ func VerifyDataRoot(data []byte, expected types.Hash) bool {
 	if len(data) == 0 {
 		return expected == types.EmptyHash()
 	}
-	computed := sha256.Sum256(data)
+	sum := sha256.Sum256(data)
+	computed := types.HashFromBytes(sum[:])
 	return computed == expected
 }
 

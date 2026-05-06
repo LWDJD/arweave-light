@@ -6,11 +6,26 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/arweave-light/types"
 )
+
+// NormalizePeerURL ensures a peer address has an http:// scheme.
+// Arweave /peers returns bare IP:port which needs a scheme for Go's http.Client.
+func NormalizePeerURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return raw
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	return "http://" + raw
+}
 
 const (
 	// MaxPeers is the maximum number of peers to store.
@@ -74,8 +89,8 @@ func (s *Store) Load() error {
 		if p.URL == "" {
 			continue
 		}
-		// Normalise: remove trailing slash
-		p.URL = trimTrailingSlash(p.URL)
+		// Normalise: add scheme if missing, remove trailing slash
+		p.URL = NormalizePeerURL(p.URL)
 		if _, exists := s.urlIndex[p.URL]; exists {
 			continue
 		}
@@ -114,11 +129,12 @@ func (s *Store) saveLocked() error {
 
 // Add adds a peer (or updates its URL if already present). Score is not
 // overwritten for existing peers. Returns the peer and whether it was newly added.
-func (s *Store) Add(url string) (*types.Peer, bool) {
+// The URL is normalized to include an http:// scheme if missing.
+func (s *Store) Add(rawURL string) (*types.Peer, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	url = trimTrailingSlash(url)
+	url := NormalizePeerURL(rawURL)
 	if url == "" {
 		return nil, false
 	}
@@ -156,7 +172,7 @@ func (s *Store) Remove(url string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	url = trimTrailingSlash(url)
+	url = NormalizePeerURL(url)
 	if _, ok := s.urlIndex[url]; !ok {
 		return false
 	}
@@ -175,7 +191,7 @@ func (s *Store) Remove(url string) bool {
 func (s *Store) Get(url string) *types.Peer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.urlIndex[trimTrailingSlash(url)]
+	return s.urlIndex[NormalizePeerURL(url)]
 }
 
 // GetAll returns a copy of all peers.
@@ -215,7 +231,7 @@ func (s *Store) UpdateScore(url string, delta int, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	url = trimTrailingSlash(url)
+	url = NormalizePeerURL(url)
 	p, ok := s.urlIndex[url]
 	if !ok {
 		return
@@ -283,9 +299,3 @@ func (s *Store) enforceLimitLocked() {
 	}
 }
 
-func trimTrailingSlash(s string) string {
-	for len(s) > 0 && s[len(s)-1] == '/' {
-		s = s[:len(s)-1]
-	}
-	return s
-}
