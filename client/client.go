@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/arweave-light/types"
@@ -18,10 +20,30 @@ type HTTPClient struct {
 	timeout    time.Duration
 }
 
+// NormalizePeerURL ensures a peer address has an HTTP scheme.
+// Arweave /peers endpoint returns bare IP:port (e.g. "165.254.143.26:1984")
+// which Go's http.Client cannot parse without a scheme.
+func NormalizePeerURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	// Remove trailing slash
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return raw
+	}
+	// Already has a scheme
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	// Bare IP:port or host:port — prepend http:// (Arweave nodes use plain HTTP by default)
+	return "http://" + raw
+}
+
 // NewHTTPClient creates a new Arweave HTTP API client.
+// The baseURL is normalized to include an http:// scheme if missing.
 func NewHTTPClient(baseURL string, timeout time.Duration) *HTTPClient {
+	normalized := NormalizePeerURL(baseURL)
 	return &HTTPClient{
-		baseURL: baseURL,
+		baseURL: normalized,
 		timeout: timeout,
 		httpClient: &http.Client{
 			Timeout: timeout,
@@ -37,8 +59,13 @@ func (c *HTTPClient) SetTimeout(d time.Duration) {
 
 // doGET performs a GET request and returns the response body.
 func (c *HTTPClient) doGET(ctx context.Context, path string) ([]byte, error) {
-	url := c.baseURL + path
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	fullURL := c.baseURL + path
+	// Safety: ensure the URL is parseable
+	if _, err := url.Parse(fullURL); err != nil {
+		return nil, fmt.Errorf("invalid URL %q: %w", fullURL, err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -63,6 +90,8 @@ func (c *HTTPClient) doGET(ctx context.Context, path string) ([]byte, error) {
 }
 
 // GetInfo retrieves the current network info.
+// The /info endpoint returns a "current" field that is a 48-byte hash
+// base64url-encoded (64 characters).
 func (c *HTTPClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 	body, err := c.doGET(ctx, "/info")
 	if err != nil {
@@ -77,6 +106,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 		return nil, fmt.Errorf("parse info: %w", err)
 	}
 
+	// Decode the current hash. It may be 32 or 48 bytes.
 	var h types.Hash
 	if err := h.UnmarshalJSON([]byte(`"` + raw.Current + `"`)); err != nil {
 		return nil, fmt.Errorf("parse current hash: %w", err)
