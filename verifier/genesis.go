@@ -260,7 +260,7 @@ func computeIndepHash(block *types.Block) types.Hash {
 	write(block.PreviousBlock.Base64())
 	write(fmt.Sprintf("%d", block.Timestamp))
 	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff)
+	write(block.Diff.String())
 	write(fmt.Sprintf("%d", block.Height))
 	write(block.HashListMerkle.Base64())
 	write(block.WalletList.Base64())

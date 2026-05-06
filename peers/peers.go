@@ -34,9 +34,6 @@ const (
 	// DefaultMinScore is the score assigned to a new peer.
 	DefaultMinScore = 0
 
-	// KickThreshold is the score below which a peer is removed.
-	KickThreshold = -10
-
 	// ScoreCorrect is added when a peer returns the consensus result.
 	ScoreCorrect = 1
 
@@ -227,6 +224,7 @@ func (s *Store) Top(n int) types.PeerList {
 }
 
 // UpdateScore adjusts a peer's score and records the outcome.
+// Unreachable peers (timeout/refused/EOF) are penalized but never kicked.
 func (s *Store) UpdateScore(url string, delta int, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,17 +242,7 @@ func (s *Store) UpdateScore(url string, delta int, success bool) {
 	} else {
 		p.FailCount++
 	}
-
-	// Kick if below threshold
-	if p.Score <= KickThreshold {
-		delete(s.urlIndex, url)
-		for i, peer := range s.peers {
-			if peer.URL == url {
-				s.peers = append(s.peers[:i], s.peers[i+1:]...)
-				break
-			}
-		}
-	}
+	// Peers are never kicked due to low score — only trimmed when MaxPeers is exceeded.
 }
 
 // RecordSuccess increments score by ScoreCorrect.

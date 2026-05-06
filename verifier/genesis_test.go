@@ -49,7 +49,7 @@ func mockComputeBlockHash(block *types.Block) types.Hash {
 	write(block.PreviousBlock.Base64())
 	write(fmt.Sprintf("%d", block.Timestamp))
 	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff)
+	write(block.Diff.String())
 	write(fmt.Sprintf("%d", block.Height))
 	write(block.HashListMerkle.Base64())
 	write(block.WalletList.Base64())
@@ -78,7 +78,7 @@ func generateMockBlocks(count int) map[uint64]*types.Block {
 			PreviousBlock:  prevHash,
 			Timestamp:      int64(120 * i),
 			LastRetarget:   int64(120 * i),
-			Diff:           "30000000",
+			Diff:           types.FlexString("30000000"),
 			Height:         height,
 			HashListMerkle: types.HashFromBytes([]byte(fmt.Sprintf("hlm-%d", i))),
 			WalletList:     types.HashFromBytes([]byte(fmt.Sprintf("wl-%d", i))),

@@ -137,7 +137,7 @@ func TestMultiClientNoConsensus(t *testing.T) {
 	t.Logf("Expected error: %v", err)
 }
 
-func TestMultiClientPeerScoringAndKick(t *testing.T) {
+func TestMultiClientPeerScoringAndNotKicked(t *testing.T) {
 	ctx := context.Background()
 
 	s1 := mockArweaveServer(t, 100, "correct-hash", nil)
@@ -165,15 +165,16 @@ func TestMultiClientPeerScoringAndKick(t *testing.T) {
 		}
 		if p := ps.Get(s4.URL); p != nil {
 			t.Logf("Round %d: bad peer score=%d", round, p.Score)
-		} else {
-			t.Logf("Round %d: bad peer already kicked", round)
 		}
 	}
 
-	if p := ps.Get(s4.URL); p != nil {
-		t.Errorf("bad peer should have been kicked, score=%d", p.Score)
+	// Bad peer should still exist (never kicked, just low score)
+	if p := ps.Get(s4.URL); p == nil {
+		t.Error("bad peer should NOT be kicked — only score is lowered")
+	} else if p.Score > -5 {
+		t.Errorf("bad peer score should be negative after mismatches: %d", p.Score)
 	}
-	t.Logf("Bad peer kicked: %v", ps.Get(s4.URL) == nil)
+	t.Logf("Bad peer retained with score=%d (not kicked)", ps.Get(s4.URL).Score)
 }
 
 func TestMultiClientTimeoutPenalty(t *testing.T) {
@@ -483,7 +484,7 @@ func TestFetchBlockFromNetwork(t *testing.T) {
 				PreviousBlock:  make48ByteHash("prev"),
 				Timestamp:      1715030400,
 				LastRetarget:   1715030300,
-				Diff:           "30000000",
+				Diff:           types.FlexString("30000000"),
 				Height:         h,
 				Hash:           expectedHash,
 				IndepHash:      expectedHash,
@@ -491,10 +492,10 @@ func TestFetchBlockFromNetwork(t *testing.T) {
 				TxRoot:         types.EmptyHash(),
 				WalletList:     types.EmptyHash(),
 				RewardAddr:     "reward-addr",
-				RewardPool:     "1000",
-				WeaveSize:      "1000000",
-				BlockSize:      "100",
-				CumulativeDiff: "500000",
+				RewardPool:     types.FlexString("1000"),
+				WeaveSize:      types.FlexString("1000000"),
+				BlockSize:      types.FlexString("100"),
+				CumulativeDiff: types.FlexString("500000"),
 				HashListMerkle: types.EmptyHash(),
 			}
 			json.NewEncoder(w).Encode(block)

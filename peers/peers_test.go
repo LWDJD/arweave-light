@@ -118,21 +118,27 @@ func TestUpdateScore(t *testing.T) {
 	}
 }
 
-func TestKickThreshold(t *testing.T) {
+func TestNoKickOnLowScore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "peers.json")
 	s := NewStore(path)
 
 	s.Add("https://doomed.example.com")
-	// KickThreshold is -10
-	for i := 0; i < 6; i++ {
-		s.RecordMismatch("https://doomed.example.com") // -2 each → -12
+	// Score goes very negative but peer is NOT kicked
+	for i := 0; i < 10; i++ {
+		s.RecordMismatch("https://doomed.example.com") // -2 each → -20
 	}
-	if s.Get("https://doomed.example.com") != nil {
-		t.Fatal("peer should have been kicked")
+	if s.Get("https://doomed.example.com") == nil {
+		t.Fatal("peer should NOT be kicked — only score is lowered")
 	}
-	if s.Len() != 0 {
-		t.Fatalf("expected 0 peers, got %d", s.Len())
+	if s.Len() != 1 {
+		t.Fatalf("expected 1 peer, got %d", s.Len())
 	}
+	// Score should be very negative
+	p := s.Get("https://doomed.example.com")
+	if p.Score > -15 {
+		t.Fatalf("expected score <= -15, got %d", p.Score)
+	}
+	t.Logf("Peer retained with score=%d (not kicked)", p.Score)
 }
 
 func TestTop(t *testing.T) {

@@ -62,7 +62,7 @@ func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) er
 	}
 
 	// 4. Verify difficulty is a valid number
-	if _, err := types.BigIntFromString(block.Diff); err != nil {
+	if _, err := types.BigIntFromString(block.Diff.String()); err != nil {
 		return fmt.Errorf("invalid difficulty: %w", err)
 	}
 
@@ -91,7 +91,7 @@ func (v *Validator) computeBlockHash(block *types.Block) types.Hash {
 	write(block.PreviousBlock.Base64())
 	write(fmt.Sprintf("%d", block.Timestamp))
 	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff)
+	write(block.Diff.String())
 	write(fmt.Sprintf("%d", block.Height))
 	write(block.HashListMerkle.Base64())
 	write(block.WalletList.Base64())

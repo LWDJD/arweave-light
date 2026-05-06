@@ -46,6 +46,11 @@ func (mc *MultiClient) SetMinConsensus(n int) {
 	mc.queryCount = max(n*2, 5)
 }
 
+// MinConsensus returns the current consensus threshold.
+func (mc *MultiClient) MinConsensus() int {
+	return mc.minConsensus
+}
+
 // PeerStore returns the underlying peer store.
 func (mc *MultiClient) PeerStore() *peers.Store {
 	return mc.peerStore

@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	version   = "0.2.0"
+	version   = "0.3.0"
 	buildTime = "unknown"
 )
 
@@ -26,11 +26,12 @@ func main() {
 	cfg := node.DefaultConfig()
 
 	dataDir := flag.String("data-dir", cfg.DataDir, "Data directory for storage")
-	peerURL := flag.String("peer", cfg.PeerURL, "Arweave node URL (fallback / legacy)")
+	peerURL := flag.String("peer", cfg.PeerURL, "Fallback peer URL (arweave.net, height-only)")
 	timeout := flag.Int("timeout", int(cfg.HTTPTimeout.Seconds()), "HTTP timeout in seconds")
 	noSync := flag.Bool("no-sync", false, "Disable automatic synchronization")
 	noValidate := flag.Bool("no-validate", false, "Disable block validation")
 
+	consensus := flag.Bool("consensus", cfg.Consensus, "Enable multi-peer consensus voting (default true)")
 	bootstrap := flag.String("bootstrap", "", "Bootstrap peer URL (required on first run)")
 	addPeer := flag.String("add-peer", "", "Manually add a peer URL")
 	listPeers := flag.Bool("list-peers", false, "List all known peers and exit")
@@ -64,6 +65,8 @@ func main() {
 	cfg.PeerURL = client.NormalizePeerURL(*peerURL)
 	cfg.HTTPTimeout = time.Duration(*timeout) * time.Second
 	cfg.ValidateBlocks = !*noValidate
+	cfg.Consensus = *consensus
+	cfg.MinConsensus = *minConsensus
 
 	if *noSync {
 		cfg.SyncEnabled = false
@@ -72,7 +75,6 @@ func main() {
 	cfg.Bootstrap = client.NormalizePeerURL(*bootstrap)
 	cfg.AddPeer = client.NormalizePeerURL(*addPeer)
 	cfg.ListPeers = *listPeers
-	cfg.MinConsensus = *minConsensus
 
 	n, err := node.New(cfg)
 	if err != nil {
@@ -103,7 +105,7 @@ func main() {
 					i+1, p.URL, p.Score, p.SuccessCount, p.FailCount)
 			}
 		}
-		fmt.Printf("Total: %d peers (max %d)\n\n", len(allPeers), 50)
+		fmt.Printf("Total: %d peers\n\n", len(allPeers))
 	}
 
 	if *showCheckpoint || *clearCheckpoint {
@@ -183,7 +185,7 @@ func main() {
 		case node.EventBlock:
 			if block, ok := evt.Data.(*types.Block); ok {
 				log.Printf("[event] New block: height=%d hash=%s txs=%d",
-					block.Height, block.Hash, len(block.Txs))
+					block.Height, block.Hash.String()[:16], len(block.Txs))
 			}
 		case node.EventSyncComplete:
 			log.Printf("[event] Sync complete at height %v", evt.Data)
@@ -209,10 +211,8 @@ func handleQueries(ctx context.Context, n *node.Node, info bool, blockHeight uin
 	}
 
 	if blockHeight > 0 {
-		// Fetch block from network first, fall back to local DB
 		block, err := n.FetchBlockByHeight(ctx, blockHeight)
 		if err != nil {
-			// Try local DB as fallback
 			block, err = n.GetBlockByHeight(blockHeight)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Block %d not found\n", blockHeight)
@@ -254,8 +254,19 @@ func handleQueries(ctx context.Context, n *node.Node, info bool, blockHeight uin
 
 	if status {
 		s := n.GetSyncStatus()
-		data, _ := json.MarshalIndent(s, "", "  ")
-		fmt.Println(string(data))
+		// Also fetch network height for context
+		netH, netErr := n.FetchNetworkHeight(ctx)
+		if netErr == nil {
+			s.TargetHeight = netH
+			if netH > s.CurrentHeight {
+				s.BlocksBehind = netH - s.CurrentHeight
+			}
+		}
+		fmt.Printf("Sync Status:\n")
+		fmt.Printf("  Syncing:        %v\n", s.Syncing)
+		fmt.Printf("  Current Height: %d\n", s.CurrentHeight)
+		fmt.Printf("  Network Height: %d\n", s.TargetHeight)
+		fmt.Printf("  Blocks Behind:  %d\n", s.BlocksBehind)
 	}
 
 	if stats {

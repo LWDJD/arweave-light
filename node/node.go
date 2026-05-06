@@ -2,9 +2,11 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -20,17 +22,18 @@ import (
 // Config holds the node configuration.
 type Config struct {
 	DataDir        string
-	PeerURL        string // legacy, kept for backwards compat
+	PeerURL        string // fallback single peer (arweave.net)
 	HTTPTimeout    time.Duration
 	SyncEnabled    bool
 	ValidateBlocks bool
 	SyncerConfig   syncer.Config
 
-	// New peer-discovery fields
-	Bootstrap     string // bootstrap peer URL (first run)
-	AddPeer       string // manual peer addition
-	ListPeers     bool   // print peer list and exit
-	MinConsensus  int    // minimum agreeing peers for consensus
+	// Peer-discovery
+	Bootstrap    string
+	AddPeer      string
+	ListPeers    bool
+	Consensus    bool // enable multi-peer consensus voting
+	MinConsensus int  // minimum agreeing peers for consensus
 }
 
 // DefaultConfig returns sensible defaults.
@@ -42,6 +45,7 @@ func DefaultConfig() Config {
 		SyncEnabled:    true,
 		ValidateBlocks: true,
 		SyncerConfig:   syncer.DefaultConfig(),
+		Consensus:      true,
 		MinConsensus:   3,
 	}
 }
@@ -54,7 +58,7 @@ type Node struct {
 	mc         *client.MultiClient
 	validator  *validator.Validator
 	syncer     *syncer.Syncer
-	singlePeer *client.HTTPClient // legacy single peer client, for direct queries
+	singlePeer *client.HTTPClient
 
 	mu       sync.RWMutex
 	running  bool
@@ -64,6 +68,8 @@ type Node struct {
 
 	startTime  time.Time
 	blocksSeen uint64
+
+	checkpointPath string
 }
 
 // Event represents something that happened in the node.
@@ -84,8 +90,9 @@ const (
 // New creates a new Node instance.
 func New(cfg Config) (*Node, error) {
 	n := &Node{
-		cfg:     cfg,
-		eventCh: make(chan Event, 1000),
+		cfg:            cfg,
+		eventCh:        make(chan Event, 1000),
+		checkpointPath: filepath.Join(cfg.DataDir, "checkpoint.json"),
 	}
 
 	// Open database
@@ -99,14 +106,18 @@ func New(cfg Config) (*Node, error) {
 	peersPath := filepath.Join(cfg.DataDir, "peers.json")
 	n.peerStore = peers.NewStore(peersPath)
 
-	// Keep legacy single-peer client for direct queries
+	// Keep single-peer client for fallback queries (height-only, no data trust)
 	n.singlePeer = client.NewHTTPClient(cfg.PeerURL, cfg.HTTPTimeout)
 
 	// Multi-client for consensus-based operations
-	if cfg.MinConsensus < 1 {
-		cfg.MinConsensus = 1
+	minC := cfg.MinConsensus
+	if !cfg.Consensus {
+		minC = 1 // effectively single-peer mode
 	}
-	n.mc = client.NewMultiClient(n.peerStore, cfg.MinConsensus, cfg.HTTPTimeout)
+	if minC < 1 {
+		minC = 1
+	}
+	n.mc = client.NewMultiClient(n.peerStore, minC, cfg.HTTPTimeout)
 
 	if cfg.ValidateBlocks {
 		n.validator = validator.NewValidator()
@@ -127,9 +138,9 @@ func (n *Node) Start(ctx context.Context) error {
 	ctx, n.cancelFn = context.WithCancel(ctx)
 	n.mu.Unlock()
 
-	log.Printf("[node] Starting arweave-light node (multi-peer)")
+	log.Printf("[node] Starting arweave-light (pure decentralized sync)")
 	log.Printf("[node] Data directory: %s", n.cfg.DataDir)
-	log.Printf("[node] Min consensus: %d", n.cfg.MinConsensus)
+	log.Printf("[node] Consensus mode: %v (min %d peers)", n.cfg.Consensus, n.cfg.MinConsensus)
 
 	// ---- Peer discovery lifecycle ----
 	if err := n.peerDiscovery(ctx); err != nil {
@@ -166,27 +177,43 @@ func (n *Node) Start(ctx context.Context) error {
 		n.peerStore.Save()
 	}
 
-	// Get network info
-	info, err := n.mc.GetInfo(ctx)
+	// ---- Load persisted checkpoint ----
+	cp := n.loadCheckpoint()
+	if cp != nil {
+		log.Printf("[node] Loaded checkpoint: height=%d indep_hash=%s",
+			cp.Height, cp.IndepHash.String()[:16])
+	}
+
+	// Get network info for display
+	netHeight, err := n.fetchNetworkHeight(ctx)
 	if err != nil {
-		log.Printf("[node] WARNING: cannot get network info via consensus: %v", err)
-		// Fall back to single peer
-		if info2, err2 := n.singlePeer.GetInfo(ctx); err2 == nil {
-			info = info2
-			log.Printf("[node] Fallback to single peer: height=%d", info.Height)
+		log.Printf("[node] WARNING: cannot get network height: %v", err)
+	} else {
+		localInfo, _ := n.db.GetChainInfo()
+		localH := uint64(0)
+		if localInfo != nil {
+			localH = localInfo.Height
 		}
-	}
-	if info != nil {
-		log.Printf("[node] Network height: %d, current hash: %s", info.Height, info.CurrentHash)
+		if cp != nil {
+			localH = cp.Height
+		}
+		log.Printf("[node] Network height: %d, local checkpoint: %d", netHeight, localH)
 	}
 
-	// Start syncer
-	if n.syncer == nil && n.cfg.SyncEnabled {
-		n.syncer = syncer.NewSyncer(n.db, n.mc, n.validator, n.cfg.SyncerConfig)
+	// ---- Start syncer ----
+	if n.cfg.SyncEnabled {
+		sCfg := n.cfg.SyncerConfig
+		sCfg.ConsensusMode = n.cfg.Consensus
+		n.syncer = syncer.NewSyncer(n.db, n.mc, n.singlePeer, n.validator, sCfg)
 		n.syncer.SetCallbacks(n.onBlock, n.onSyncComplete)
-	}
+		n.syncer.OnCheckpointSet(func(cp *syncer.TrustedCheckpoint) {
+			n.saveCheckpoint(cp)
+		})
 
-	if n.syncer != nil {
+		if cp != nil {
+			n.syncer.SetCheckpoint(cp)
+		}
+
 		go func() {
 			if err := n.syncer.SyncToTip(ctx); err != nil {
 				if !errors.Is(err, context.Canceled) {
@@ -210,7 +237,6 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 	}
 
 	if n.peerStore.Len() == 0 {
-		// No peers file yet — first run
 		return n.bootstrap(ctx)
 	}
 
@@ -223,7 +249,6 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 func (n *Node) bootstrap(ctx context.Context) error {
 	bootstrapURL := n.cfg.Bootstrap
 	if bootstrapURL == "" {
-		// Fall back to the legacy peer URL as bootstrap
 		bootstrapURL = n.cfg.PeerURL
 	}
 
@@ -233,26 +258,20 @@ func (n *Node) bootstrap(ctx context.Context) error {
 
 	log.Printf("[node] First run: bootstrapping from %s", bootstrapURL)
 
-	// Add bootstrap as a regular peer
 	n.peerStore.Add(bootstrapURL)
 	n.peerStore.RecordSuccess(bootstrapURL)
 
-	// Fetch peer list from bootstrap
 	bootstrapClient := client.NewHTTPClient(bootstrapURL, n.cfg.HTTPTimeout)
 	peerURLs, err := bootstrapClient.GetPeers(ctx)
 	if err != nil {
 		log.Printf("[node] Failed to get peers from bootstrap: %v", err)
-		// Still save the bootstrap peer alone
 		return n.peerStore.Save()
 	}
 
 	log.Printf("[node] Bootstrap returned %d peers", len(peerURLs))
-
-	// Merge into store
 	added := n.peerStore.AddPeers(peerURLs)
 	log.Printf("[node] Added %d new peers (total: %d)", added, n.peerStore.Len())
 
-	// Bootstrap is now just a regular peer — no special handling
 	return n.peerStore.Save()
 }
 
@@ -313,7 +332,6 @@ func (n *Node) Stop() error {
 		n.syncer.Cancel()
 	}
 
-	// Save peer state
 	if err := n.peerStore.Save(); err != nil {
 		log.Printf("[node] Failed to save peers: %v", err)
 	}
@@ -375,13 +393,23 @@ func (n *Node) GetChainInfo() (*types.ChainInfo, error) {
 	return n.db.GetChainInfo()
 }
 
-// FetchBlockByHeight fetches a block from the network by height (through single peer).
+// FetchBlockByHeight fetches a block from the network by height.
 func (n *Node) FetchBlockByHeight(ctx context.Context, height uint64) (*types.Block, error) {
 	return n.singlePeer.GetBlockByHeight(ctx, height)
 }
 
 // FetchNetworkHeight returns the current network height.
 func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
+	return n.fetchNetworkHeight(ctx)
+}
+
+func (n *Node) fetchNetworkHeight(ctx context.Context) (uint64, error) {
+	if n.cfg.Consensus && n.peerStore.Len() > 0 {
+		info, err := n.mc.GetInfo(ctx)
+		if err == nil {
+			return info.Height, nil
+		}
+	}
 	info, err := n.singlePeer.GetInfo(ctx)
 	if err != nil {
 		return 0, err
@@ -391,12 +419,13 @@ func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
 
 // GetNetworkInfo returns info from the peer network.
 func (n *Node) GetNetworkInfo(ctx context.Context) (*types.ChainInfo, error) {
-	info, err := n.mc.GetInfo(ctx)
-	if err != nil {
-		// Fall back to single peer
-		return n.singlePeer.GetInfo(ctx)
+	if n.cfg.Consensus && n.peerStore.Len() > 0 {
+		info, err := n.mc.GetInfo(ctx)
+		if err == nil {
+			return info, nil
+		}
 	}
-	return info, nil
+	return n.singlePeer.GetInfo(ctx)
 }
 
 // GetSyncStatus returns the current sync status.
@@ -404,7 +433,21 @@ func (n *Node) GetSyncStatus() types.SyncStatus {
 	if n.syncer != nil {
 		return n.syncer.Status()
 	}
-	return types.SyncStatus{}
+	cp := n.loadCheckpoint()
+	info, _ := n.db.GetChainInfo()
+	h := uint64(0)
+	if cp != nil {
+		h = cp.Height
+	}
+	if info != nil && info.Height > h {
+		h = info.Height
+	}
+	return types.SyncStatus{
+		Syncing:       false,
+		CurrentHeight: h,
+		TargetHeight:  0,
+		BlocksBehind:  0,
+	}
 }
 
 // SyncToTip triggers a manual sync.
@@ -429,7 +472,7 @@ func (n *Node) GetPeers(ctx context.Context) ([]string, error) {
 	return n.peerStore.URLs(), nil
 }
 
-// GetValidator returns the node's validator (for genesis verification, etc.).
+// GetValidator returns the node's validator.
 func (n *Node) GetValidator() *validator.Validator {
 	return n.validator
 }
@@ -457,20 +500,83 @@ func (n *Node) Stats() map[string]interface{} {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
-	info, _ := n.db.GetChainInfo()
+	cp := n.loadCheckpoint()
 	height := uint64(0)
-	if info != nil {
+	if cp != nil {
+		height = cp.Height
+	}
+	info, _ := n.db.GetChainInfo()
+	if info != nil && info.Height > height {
 		height = info.Height
 	}
 
 	return map[string]interface{}{
-		"running":      n.running,
-		"uptime":       time.Since(n.startTime).String(),
-		"height":       height,
-		"blocks_seen":  n.blocksSeen,
-		"peer_count":   n.peerStore.Len(),
-		"peer":         n.cfg.PeerURL,
+		"running":       n.running,
+		"uptime":        time.Since(n.startTime).String(),
+		"height":        height,
+		"blocks_seen":   n.blocksSeen,
+		"peer_count":    n.peerStore.Len(),
+		"peer":          n.cfg.PeerURL,
+		"consensus":     n.cfg.Consensus,
 		"min_consensus": n.cfg.MinConsensus,
+	}
+}
+
+// ---- checkpoint persistence ----
+
+type checkpointFile struct {
+	Height    uint64 `json:"height"`
+	IndepHash string `json:"indep_hash"`
+	BlockHash string `json:"block_hash"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+func (n *Node) loadCheckpoint() *syncer.TrustedCheckpoint {
+	data, err := os.ReadFile(n.checkpointPath)
+	if err != nil {
+		return nil
+	}
+	var cf checkpointFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil
+	}
+	var indepHash types.Hash
+	if err := indepHash.UnmarshalJSON([]byte(`"` + cf.IndepHash + `"`)); err != nil {
+		return nil
+	}
+	var blockHash types.Hash
+	if err := blockHash.UnmarshalJSON([]byte(`"` + cf.BlockHash + `"`)); err != nil {
+		// block_hash may be empty for old checkpoints
+		blockHash = types.EmptyHash()
+	}
+	return &syncer.TrustedCheckpoint{
+		Height:    cf.Height,
+		IndepHash: indepHash,
+		BlockHash: blockHash,
+		Timestamp: cf.Timestamp,
+	}
+}
+
+func (n *Node) saveCheckpoint(cp *syncer.TrustedCheckpoint) {
+	cf := checkpointFile{
+		Height:    cp.Height,
+		IndepHash: cp.IndepHash.Base64(),
+		BlockHash: cp.BlockHash.Base64(),
+		Timestamp: cp.Timestamp,
+	}
+	data, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		log.Printf("[node] Failed to marshal checkpoint: %v", err)
+		return
+	}
+	tmpPath := n.checkpointPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		log.Printf("[node] Failed to write checkpoint: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, n.checkpointPath); err != nil {
+		log.Printf("[node] Failed to rename checkpoint: %v", err)
+		return
 	}
 }
 
