@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,11 +30,28 @@ type Config struct {
 	SyncerConfig   syncer.Config
 
 	// Peer-discovery
-	Bootstrap    string
-	AddPeer      string
-	ListPeers    bool
-	Consensus    bool // enable multi-peer consensus voting
-	MinConsensus int  // minimum agreeing peers for consensus
+	Bootstrap     string
+	AddPeer       string
+	ListPeers     bool
+	SecurityLevel string // "low" or "high" — controls consensus quorum size
+}
+
+// SecurityLevel constants
+const (
+	SecurityLow  = "low"
+	SecurityHigh = "high"
+)
+
+// SecurityLevelConfig maps a security level to MultiClient parameters.
+type SecurityLevelConfig struct {
+	QueryCount   int
+	MinConsensus int
+}
+
+// SecurityLevels defines the parameters for each security level.
+var SecurityLevels = map[string]SecurityLevelConfig{
+	SecurityLow:  {QueryCount: 5, MinConsensus: 3},
+	SecurityHigh: {QueryCount: 20, MinConsensus: 3},
 }
 
 // TrustedSeeds is a list of known stable Arweave peer addresses compiled
@@ -59,8 +77,7 @@ func DefaultConfig() Config {
 		SyncEnabled:    true,
 		ValidateBlocks: true,
 		SyncerConfig:   syncer.DefaultConfig(),
-		Consensus:      true,
-		MinConsensus:   3,
+		SecurityLevel:  SecurityHigh,
 	}
 }
 
@@ -133,15 +150,13 @@ func New(cfg Config) (*Node, error) {
 	n.singlePeer = client.NewHTTPClient(cfg.PeerURL, cfg.HTTPTimeout)
 
 	// Multi-client for consensus-based operations
-	minC := cfg.MinConsensus
-	if !cfg.Consensus {
-		minC = 1 // effectively single-peer mode
+	secCfg, ok := SecurityLevels[cfg.SecurityLevel]
+	if !ok {
+		secCfg = SecurityLevels[SecurityHigh] // fallback to high
 	}
-	if minC < 1 {
-		minC = 1
-	}
-	n.mc = client.NewMultiClient(n.peerStore, minC, cfg.HTTPTimeout)
+	n.mc = client.NewMultiClient(n.peerStore, secCfg.MinConsensus, cfg.HTTPTimeout)
 	n.mc.SetLogger(logger.NewLogger("multiclient"))
+	n.mc.SetQueryCount(secCfg.QueryCount)
 
 	if cfg.ValidateBlocks {
 		n.validator = validator.NewValidator()
@@ -164,7 +179,8 @@ func (n *Node) Start(ctx context.Context) error {
 
 	n.log.Info("Starting arweave-light (pure decentralized sync)")
 	n.log.Info("Data directory: %s", n.cfg.DataDir)
-	n.log.Info("Consensus mode: %v (min %d peers)", n.cfg.Consensus, n.cfg.MinConsensus)
+	secCfg := SecurityLevels[n.cfg.SecurityLevel]
+	n.log.Info("Security level: %s (query %d peers, min %d agree)", n.cfg.SecurityLevel, secCfg.QueryCount, secCfg.MinConsensus)
 
 	// ---- Peer discovery lifecycle ----
 	if err := n.peerDiscovery(ctx); err != nil {
@@ -202,7 +218,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 
 	// If we still have too few peers after bootstrap, immediately try to refresh
-	if n.peerStore.Len() < n.cfg.MinConsensus*2 {
+	if n.peerStore.Len() < secCfg.MinConsensus*2 {
 		go func() {
 			time.Sleep(2 * time.Second) // wait for bootstrap peers to stabilize
 			n.log.Info("Attempting immediate peer refresh (only %d peers)", n.peerStore.Len())
@@ -245,7 +261,7 @@ func (n *Node) Start(ctx context.Context) error {
 	// ---- Start syncer ----
 	if n.cfg.SyncEnabled {
 		sCfg := n.cfg.SyncerConfig
-		sCfg.ConsensusMode = n.cfg.Consensus
+		sCfg.ConsensusMode = n.cfg.SecurityLevel != "" // consensus enabled if security level set
 		n.syncer = syncer.NewSyncer(n.db, n.mc, n.singlePeer, n.validator, sCfg)
 		n.syncer.SetCallbacks(n.onBlock, n.onSyncComplete)
 		n.syncer.OnCheckpointSet(func(cp *syncer.TrustedCheckpoint) {
@@ -266,8 +282,8 @@ func (n *Node) Start(ctx context.Context) error {
 		}()
 	}
 
-	// Start periodic peer refresh
-	go n.peerRefreshLoop(ctx)
+	// Start continuous peer discovery loop (independent goroutine)
+	go n.peerDiscoveryLoop(ctx)
 
 	return nil
 }
@@ -283,9 +299,10 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 		n.addTrustedSeeds()
 	}
 
-	// Bootstrap if we have no peers OR fewer than required for consensus
-	if n.peerStore.Len() == 0 || n.peerStore.Len() < n.cfg.MinConsensus {
-		n.log.Info("Too few peers (%d < %d), bootstrapping...", n.peerStore.Len(), n.cfg.MinConsensus)
+	// Bootstrap if we have no peers or fewer than the security level's minimum
+	secCfg := SecurityLevels[n.cfg.SecurityLevel]
+	if n.peerStore.Len() == 0 || n.peerStore.Len() < secCfg.MinConsensus {
+		n.log.Info("Too few peers (%d < %d), bootstrapping...", n.peerStore.Len(), secCfg.MinConsensus)
 		if err := n.bootstrap(ctx); err != nil {
 			n.log.Warn("Bootstrap failed: %v", err)
 		}
@@ -349,31 +366,102 @@ func (n *Node) bootstrap(ctx context.Context) error {
 	return n.peerStore.Save()
 }
 
-// peerRefreshLoop periodically fetches updated peer lists.
-func (n *Node) peerRefreshLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
+// peerDiscoveryLoop is a continuous goroutine that discovers new peers.
+//
+// Each round:
+//  1. Randomly selects 1–3 known peers
+//  2. Queries each for their /peers list, one at a time
+//  3. On failure → immediately tries the next peer (no sleep)
+//  4. On first success → adds discovered peers, round ends
+//  5. If all fail → tries a new random batch (up to maxAttempts)
+//  6. Waits 10 seconds after round completes, then repeats
+func (n *Node) peerDiscoveryLoop(ctx context.Context) {
+	n.log.Info("Starting continuous peer discovery loop")
+	const maxAttempts = 5
 
 	for {
 		select {
 		case <-ctx.Done():
+			n.log.Info("Peer discovery loop stopped")
 			return
-		case <-ticker.C:
-			n.log.Info("Refreshing peer list...")
-			newURLs, err := n.mc.GetPeersFromAll(ctx)
-			if err != nil {
-				n.log.Warn("Peer refresh failed: %v", err)
+		default:
+		}
+
+		discovered := false
+		for attempts := 0; attempts < maxAttempts; attempts++ {
+			// Pick 1-3 random peers
+			count := rand.Intn(3) + 1
+			peerList := n.peerStore.Random(count)
+			if len(peerList) == 0 {
+				n.log.Debug("Peer discovery: no peers available, retrying in 2s")
+				time.Sleep(2 * time.Second)
 				continue
 			}
-			added := n.peerStore.AddPeers(newURLs)
-			if added > 0 {
-				n.log.Info("Peer refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
-				n.peerStore.Save()
-			} else {
-				n.log.Info("Peer refresh: no new peers found")
+
+			for _, p := range peerList {
+				select {
+				case <-ctx.Done():
+					n.log.Info("Peer discovery loop stopped")
+					return
+				default:
+				}
+
+				newPeers, err := n.fetchPeersFrom(ctx, p.URL)
+				if err != nil {
+					n.log.Debug("Peer discovery: %s failed: %v", p.URL, err)
+					n.peerStore.RecordTimeout(p.URL)
+					continue // immediately try next peer
+				}
+
+				if len(newPeers) > 0 {
+					added := n.peerStore.AddPeers(newPeers)
+					if added > 0 {
+						n.log.Info("Peer discovery: added %d new peers from %s (total: %d)", added, p.URL, n.peerStore.Len())
+						n.peerStore.Save()
+						n.peerStore.RecordSuccess(p.URL)
+					}
+				}
+				discovered = true
+				break // success → end this batch
 			}
+
+			if discovered {
+				break // end attempts
+			}
+			// All peers in this batch failed — retry immediately with new random batch
+		}
+
+		if !discovered {
+			n.log.Debug("Peer discovery: no peers found in this round")
+		}
+
+		// Round complete → wait 10 seconds before next round
+		select {
+		case <-ctx.Done():
+			n.log.Info("Peer discovery loop stopped")
+			return
+		case <-time.After(10 * time.Second):
 		}
 	}
+}
+
+// fetchPeersFrom queries a single peer's /peers endpoint.
+func (n *Node) fetchPeersFrom(ctx context.Context, url string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, n.cfg.HTTPTimeout)
+	defer cancel()
+
+	hc := n.mc.SingleClient(url)
+	rawPeers, err := hc.GetPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize all peer URLs
+	normalized := make([]string, 0, len(rawPeers))
+	for _, p := range rawPeers {
+		normalized = append(normalized, peers.NormalizePeerURL(p))
+	}
+	return normalized, nil
 }
 
 func (n *Node) printPeers() {
@@ -478,7 +566,7 @@ func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
 }
 
 func (n *Node) fetchNetworkHeight(ctx context.Context) (uint64, error) {
-	if n.cfg.Consensus && n.peerStore.Len() > 0 {
+	if n.cfg.SecurityLevel != "" && n.peerStore.Len() > 0 {
 		info, err := n.mc.GetInfo(ctx)
 		if err == nil {
 			return info.Height, nil
@@ -493,7 +581,7 @@ func (n *Node) fetchNetworkHeight(ctx context.Context) (uint64, error) {
 
 // GetNetworkInfo returns info from the peer network.
 func (n *Node) GetNetworkInfo(ctx context.Context) (*types.ChainInfo, error) {
-	if n.cfg.Consensus && n.peerStore.Len() > 0 {
+	if n.cfg.SecurityLevel != "" && n.peerStore.Len() > 0 {
 		info, err := n.mc.GetInfo(ctx)
 		if err == nil {
 			return info, nil
@@ -591,8 +679,7 @@ func (n *Node) Stats() map[string]interface{} {
 		"blocks_seen":   n.blocksSeen,
 		"peer_count":    n.peerStore.Len(),
 		"peer":          n.cfg.PeerURL,
-		"consensus":     n.cfg.Consensus,
-		"min_consensus": n.cfg.MinConsensus,
+		"security_level": n.cfg.SecurityLevel,
 	}
 }
 

@@ -3,6 +3,7 @@ package peers
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -233,6 +234,28 @@ func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.peers)
+}
+
+// Random returns up to n randomly selected peers.
+func (s *Store) Random(n int) types.PeerList {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if n <= 0 || len(s.peers) == 0 {
+		return nil
+	}
+	if n >= len(s.peers) {
+		out := make(types.PeerList, len(s.peers))
+		copy(out, s.peers)
+		return out
+	}
+
+	indices := rand.Perm(len(s.peers))[:n]
+	out := make(types.PeerList, n)
+	for i, idx := range indices {
+		out[i] = s.peers[idx]
+	}
+	return out
 }
 
 // Top returns the N highest-scored peers.

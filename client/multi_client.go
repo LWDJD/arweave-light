@@ -64,6 +64,11 @@ func (mc *MultiClient) MinConsensus() int {
 	return mc.minConsensus
 }
 
+// SetQueryCount overrides the number of peers queried per operation.
+func (mc *MultiClient) SetQueryCount(n int) {
+	mc.queryCount = n
+}
+
 // PeerStore returns the underlying peer store.
 func (mc *MultiClient) PeerStore() *peers.Store {
 	return mc.peerStore

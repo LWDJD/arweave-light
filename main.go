@@ -31,11 +31,10 @@ func main() {
 	noSync := flag.Bool("no-sync", false, "Disable automatic synchronization")
 	noValidate := flag.Bool("no-validate", false, "Disable block validation")
 
-	consensus := flag.Bool("consensus", cfg.Consensus, "Enable multi-peer consensus voting (default true)")
+	security := flag.String("security", cfg.SecurityLevel, "Consensus security level: low or high (default high)")
 	bootstrap := flag.String("bootstrap", "", "Bootstrap peer URL (required on first run)")
 	addPeer := flag.String("add-peer", "", "Manually add a peer URL")
 	listPeers := flag.Bool("list-peers", false, "List all known peers and exit")
-	minConsensus := flag.Int("min-consensus", cfg.MinConsensus, "Minimum agreeing peers for consensus (default 3)")
 
 	queryBlock := flag.Uint64("block", 0, "Query a specific block by height")
 	queryTx := flag.String("tx", "", "Query a transaction by ID (base64)")
@@ -89,8 +88,7 @@ func main() {
 	cfg.PeerURL = client.NormalizePeerURL(*peerURL)
 	cfg.HTTPTimeout = time.Duration(*timeout) * time.Second
 	cfg.ValidateBlocks = !*noValidate
-	cfg.Consensus = *consensus
-	cfg.MinConsensus = *minConsensus
+	cfg.SecurityLevel = *security
 
 	if *noSync {
 		cfg.SyncEnabled = false
