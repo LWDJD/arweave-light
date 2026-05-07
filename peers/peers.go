@@ -3,6 +3,7 @@ package peers
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 )
 
@@ -34,9 +36,6 @@ const (
 	// DefaultMinScore is the score assigned to a new peer.
 	DefaultMinScore = 0
 
-	// KickThreshold is the score below which a peer is removed.
-	KickThreshold = -10
-
 	// ScoreCorrect is added when a peer returns the consensus result.
 	ScoreCorrect = 1
 
@@ -53,6 +52,7 @@ type Store struct {
 	path     string
 	peers    types.PeerList
 	urlIndex map[string]*types.Peer
+	log      *logger.Logger
 }
 
 // NewStore creates a new peer store backed by the given file path.
@@ -62,6 +62,13 @@ func NewStore(path string) *Store {
 		peers:    make(types.PeerList, 0),
 		urlIndex: make(map[string]*types.Peer),
 	}
+}
+
+// SetLogger sets the logger for this peer store.
+func (s *Store) SetLogger(l *logger.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log = l
 }
 
 // Load reads peers from the JSON file. If the file does not exist it is not an error.
@@ -152,6 +159,11 @@ func (s *Store) Add(rawURL string) (*types.Peer, bool) {
 	s.peers = append(s.peers, p)
 	s.urlIndex[url] = p
 	s.enforceLimitLocked()
+
+	if s.log != nil {
+		s.log.Info("Peer connected: %s", url)
+	}
+
 	return p, true
 }
 
@@ -181,6 +193,9 @@ func (s *Store) Remove(url string) bool {
 	for i, p := range s.peers {
 		if p.URL == url {
 			s.peers = append(s.peers[:i], s.peers[i+1:]...)
+			if s.log != nil {
+				s.log.Info("Peer disconnected: %s", url)
+			}
 			return true
 		}
 	}
@@ -192,6 +207,17 @@ func (s *Store) Get(url string) *types.Peer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.urlIndex[NormalizePeerURL(url)]
+}
+
+// GetScore returns the credit score of a peer, or 0 if the peer is unknown.
+// This is used by the weighted-voting consensus in MultiClient.
+func (s *Store) GetScore(url string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.urlIndex[NormalizePeerURL(url)]; ok {
+		return p.Score
+	}
+	return 0
 }
 
 // GetAll returns a copy of all peers.
@@ -208,6 +234,28 @@ func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.peers)
+}
+
+// Random returns up to n randomly selected peers.
+func (s *Store) Random(n int) types.PeerList {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if n <= 0 || len(s.peers) == 0 {
+		return nil
+	}
+	if n >= len(s.peers) {
+		out := make(types.PeerList, len(s.peers))
+		copy(out, s.peers)
+		return out
+	}
+
+	indices := rand.Perm(len(s.peers))[:n]
+	out := make(types.PeerList, n)
+	for i, idx := range indices {
+		out[i] = s.peers[idx]
+	}
+	return out
 }
 
 // Top returns the N highest-scored peers.
@@ -227,6 +275,7 @@ func (s *Store) Top(n int) types.PeerList {
 }
 
 // UpdateScore adjusts a peer's score and records the outcome.
+// Unreachable peers (timeout/refused/EOF) are penalized but never kicked.
 func (s *Store) UpdateScore(url string, delta int, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,17 +293,7 @@ func (s *Store) UpdateScore(url string, delta int, success bool) {
 	} else {
 		p.FailCount++
 	}
-
-	// Kick if below threshold
-	if p.Score <= KickThreshold {
-		delete(s.urlIndex, url)
-		for i, peer := range s.peers {
-			if peer.URL == url {
-				s.peers = append(s.peers[:i], s.peers[i+1:]...)
-				break
-			}
-		}
-	}
+	// Peers are never kicked due to low score — only trimmed when MaxPeers is exceeded.
 }
 
 // RecordSuccess increments score by ScoreCorrect.
@@ -265,11 +304,17 @@ func (s *Store) RecordSuccess(url string) {
 // RecordMismatch decrements score by ScoreMismatch.
 func (s *Store) RecordMismatch(url string) {
 	s.UpdateScore(url, ScoreMismatch, false)
+	if s.log != nil {
+		s.log.Warn("Peer data mismatch: %s", url)
+	}
 }
 
 // RecordTimeout decrements score by ScoreTimeout.
 func (s *Store) RecordTimeout(url string) {
 	s.UpdateScore(url, ScoreTimeout, false)
+	if s.log != nil {
+		s.log.Warn("Peer timeout: %s", url)
+	}
 }
 
 // URLs returns a string slice of all peer URLs.
@@ -296,6 +341,8 @@ func (s *Store) enforceLimitLocked() {
 		url := s.peers[worst].URL
 		delete(s.urlIndex, url)
 		s.peers = append(s.peers[:worst], s.peers[worst+1:]...)
+		if s.log != nil {
+			s.log.Warn("Peer evicted due to max peer limit: %s", url)
+		}
 	}
 }
-

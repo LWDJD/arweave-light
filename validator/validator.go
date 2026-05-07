@@ -8,9 +8,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
 
-	"github.com/arweave-light/merkle"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 	"golang.org/x/crypto/blake2b"
 )
@@ -20,35 +19,32 @@ var (
 	ErrInvalidSignature     = errors.New("validator: invalid RSA signature")
 	ErrInvalidBlockHash     = errors.New("validator: block hash does not match")
 	ErrInvalidTxRoot        = errors.New("validator: transaction root mismatch")
-	ErrInvalidDifficulty    = errors.New("validator: insufficient difficulty")
 	ErrBlockTooOld          = errors.New("validator: block too old")
 	ErrInvalidPreviousBlock = errors.New("validator: previous block hash mismatch")
+	ErrIndepHashMismatch    = errors.New("validator: indep_hash mismatch")
 )
 
 // Validator checks block and transaction validity.
 type Validator struct {
 	keyCache map[string]*rsa.PublicKey
+	log      *logger.Logger
 }
 
 // NewValidator creates a new Validator.
 func NewValidator() *Validator {
 	return &Validator{
 		keyCache: make(map[string]*rsa.PublicKey),
+		log:      logger.NewLogger("validator"),
 	}
 }
 
 // ValidateBlock performs full block validation.
 func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) error {
-	// 1. Verify block hash
-	if err := v.validateBlockHash(block); err != nil {
-		return err
-	}
-
-	// 2. Check previous block hash
+	// 1. Check previous block hash (chain continuity)
 	if prevBlock != nil {
-		if block.PreviousBlock != prevBlock.Hash {
-			return fmt.Errorf("%w: expected %s, got %s",
-				ErrInvalidPreviousBlock, prevBlock.Hash, block.PreviousBlock)
+		if block.PreviousBlock != prevBlock.IndepHash {
+			return fmt.Errorf("%w: expected previous_block=%s (prev indep_hash), got %s",
+				ErrInvalidPreviousBlock, prevBlock.IndepHash.Base64()[:16], block.PreviousBlock.Base64()[:16])
 		}
 		if block.Height != prevBlock.Height+1 {
 			return fmt.Errorf("validator: invalid height: %d, expected %d",
@@ -56,68 +52,60 @@ func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) er
 		}
 	}
 
-	// 3. Verify tx_root
+	// 2. Verify tx_root
 	if err := v.validateTxRoot(block); err != nil {
 		return err
 	}
 
-	// 4. Verify difficulty is a valid number
-	if _, err := types.BigIntFromString(block.Diff); err != nil {
-		return fmt.Errorf("invalid difficulty: %w", err)
-	}
-
 	return nil
 }
 
-// validateBlockHash verifies block.Hash matches computed hash.
-func (v *Validator) validateBlockHash(block *types.Block) error {
-	computed := v.computeBlockHash(block)
-	if computed != block.Hash {
-		return fmt.Errorf("%w: computed %s, got %s",
-			ErrInvalidBlockHash, computed, block.Hash)
+// ValidateIndepHash verifies the block's indep_hash against chain continuity.
+// For a light node, the indep_hash cannot be independently recomputed
+// (it requires full node internals like nonce_limiter_info and signature),
+// so we verify chain continuity: if prevBlock is provided, current block's
+// previous_block must equal prevBlock's indep_hash.
+//
+// For the bootstrap block (prevBlock == nil), this check is a no-op because
+// the block's indep_hash is verified through multi-peer consensus.
+func (v *Validator) ValidateIndepHash(block *types.Block, prevBlock *types.Block) error {
+	// Chain continuity: this block's previous_block must match the
+	// previous block's indep_hash. This ensures blocks form a valid chain.
+	if prevBlock != nil {
+		if block.PreviousBlock != prevBlock.IndepHash {
+			return fmt.Errorf("%w: chain broken at height %d — previous_block=%s, prev indep_hash=%s",
+				ErrIndepHashMismatch,
+				block.Height,
+				block.PreviousBlock.Base64()[:16],
+				prevBlock.IndepHash.Base64()[:16])
+		}
 	}
 	return nil
-}
-
-// computeBlockHash computes the block hash per Arweave spec.
-func (v *Validator) computeBlockHash(block *types.Block) types.Hash {
-	hasher := sha256.New()
-
-	write := func(s string) {
-		hasher.Write([]byte(s))
-	}
-
-	write(block.Nonce)
-	write(block.PreviousBlock.Base64())
-	write(fmt.Sprintf("%d", block.Timestamp))
-	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff)
-	write(fmt.Sprintf("%d", block.Height))
-	write(block.HashListMerkle.Base64())
-	write(block.WalletList.Base64())
-	write(block.RewardAddr)
-	for _, tag := range block.Tags {
-		hasher.Write([]byte(tag.Name))
-		hasher.Write([]byte(tag.Value))
-	}
-
-	var h types.Hash
-	copy(h[:], hasher.Sum(nil))
-	return h
 }
 
 // validateTxRoot checks the Merkle root of transaction IDs.
+//
+// Arweave's tx_root is computed from {DataRoot, Offset} pairs using an
+// unbalanced Merkle tree (see ar_merkle.erl:generate_tree). A light node
+// only has transaction IDs, not the data_root or data_size of each
+// transaction, and therefore cannot independently recompute tx_root.
+//
+// We perform basic structural validation (empty list → empty root,
+// non-empty list → non-empty root) and log a debug message. Full
+// validation requires fetching each transaction's data_root.
 func (v *Validator) validateTxRoot(block *types.Block) error {
 	if len(block.Txs) == 0 && block.TxRoot == types.EmptyHash() {
 		return nil
 	}
-	ok, err := merkle.ValidateTxRoot(block.Txs, block.TxRoot)
-	if err != nil {
-		return fmt.Errorf("tx_root validation: %w", err)
+	if len(block.Txs) > 0 && block.TxRoot == types.EmptyHash() {
+		return fmt.Errorf("%w: non-empty tx list (%d txs) requires non-empty tx_root",
+			ErrInvalidTxRoot, len(block.Txs))
 	}
-	if !ok {
-		return ErrInvalidTxRoot
-	}
+	// Basic structural check passed. For light nodes we cannot recompute
+	// the exact tx_root without full transaction data (data_root + data_size).
+	// Chain continuity and multi-peer consensus provide security.
+	v.log.Debug("Block %d: tx_root structural check passed (%d txs, root=%s)",
+		block.Height, len(block.Txs), block.TxRoot.Base64()[:16])
 	return nil
 }
 
@@ -226,12 +214,6 @@ func Blake2bHash(data []byte) ([]byte, error) {
 	}
 	h.Write(data)
 	return h.Sum(nil), nil
-}
-
-// ValidateDifficulty checks if a block hash satisfies the required difficulty.
-func ValidateDifficulty(blockHash types.Hash, diff *big.Int) bool {
-	hashBig := new(big.Int).SetBytes(blockHash[:])
-	return hashBig.Cmp(diff) <= 0
 }
 
 // DeepHash computes a deep hash (Arweave v2 style).

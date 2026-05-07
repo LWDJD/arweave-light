@@ -2,7 +2,6 @@ package verifier
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -19,8 +18,8 @@ import (
 
 // mockFetcher implements BlockFetcher for testing.
 type mockFetcher struct {
-	blocks    map[uint64]*types.Block
-	height    uint64
+	blocks map[uint64]*types.Block
+	height uint64
 }
 
 func (mf *mockFetcher) FetchBlockByHeight(ctx context.Context, height uint64) (*types.Block, error) {
@@ -38,66 +37,44 @@ func (mf *mockFetcher) FetchNetworkHeight(ctx context.Context) (uint64, error) {
 	return mf.height, nil
 }
 
-// mockComputeBlockHash replicates validator.computeBlockHash for correct mock hashes.
-// Defined here because validator.computeBlockHash is unexported.
-func mockComputeBlockHash(block *types.Block) types.Hash {
-	hasher := sha256.New()
-	write := func(s string) {
-		hasher.Write([]byte(s))
-	}
-	write(block.Nonce)
-	write(block.PreviousBlock.Base64())
-	write(fmt.Sprintf("%d", block.Timestamp))
-	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff)
-	write(fmt.Sprintf("%d", block.Height))
-	write(block.HashListMerkle.Base64())
-	write(block.WalletList.Base64())
-	write(block.RewardAddr)
-	for _, tag := range block.Tags {
-		hasher.Write([]byte(tag.Name))
-		hasher.Write([]byte(tag.Value))
-	}
-	var h types.Hash
-	copy(h[:], hasher.Sum(nil))
-	return h
-}
-
-// computeIndepHash and generateMockBlocks create deterministic mock blocks for testing.
-// Block.Hash and Block.IndepHash are properly computed to pass validation.
+// generateMockBlocks creates a valid chain of mock blocks for testing.
+// Each block's PreviousBlock points to the previous block's IndepHash.
 func generateMockBlocks(count int) map[uint64]*types.Block {
 	blocks := make(map[uint64]*types.Block, count)
-
 	rng := rand.New(rand.NewSource(42))
-	var prevHash types.Hash
+
+	var prevIndepHash types.Hash
 
 	for i := 0; i < count; i++ {
 		height := uint64(i)
+
+		// Generate unique indep_hash (simulates what network returns)
+		indepHash := types.HashFromBytes([]byte(fmt.Sprintf("indep-%016d-%016x", height, rng.Uint64())))
+
+		// Generate a unique block hash
+		var hashBytes [48]byte
+		copy(hashBytes[:], []byte(fmt.Sprintf("hash-%016d-%016x", height, rng.Uint64())))
+		hash := types.Hash(hashBytes)
+
 		block := &types.Block{
 			Nonce:          fmt.Sprintf("%016x", rng.Uint64()),
-			PreviousBlock:  prevHash,
-			Timestamp:      int64(120 * i),
-			LastRetarget:   int64(120 * i),
-			Diff:           "30000000",
+			PreviousBlock:  prevIndepHash,
+			Timestamp:      int64(120 * (i + 10000000)), // realistic timestamps
+			LastRetarget:   int64(120 * (i + 10000000)),
+			Diff:           types.FlexString("1000"),
 			Height:         height,
 			HashListMerkle: types.HashFromBytes([]byte(fmt.Sprintf("hlm-%d", i))),
 			WalletList:     types.HashFromBytes([]byte(fmt.Sprintf("wl-%d", i))),
-			RewardAddr:     "reward-addr",
+			RewardAddr:     "reward-addr-test",
 			Tags:           []types.Tag{},
 			Txs:            []types.Hash{},
 			TxRoot:         types.Hash{},
-			Hash:           types.Hash{},
-			IndepHash:      types.Hash{},
+			Hash:           hash,
+			IndepHash:      indepHash,
 		}
 
-		// Step 1: compute block.Hash using the same algorithm as validator
-		block.Hash = mockComputeBlockHash(block)
-
-		// Step 2: compute block.IndepHash (depends on Hash) using verifier's function
-		block.IndepHash = computeIndepHash(block)
-
 		blocks[height] = block
-		prevHash = block.Hash
+		prevIndepHash = indepHash
 	}
 
 	return blocks
@@ -258,6 +235,31 @@ func TestGenesisVerifyAlreadyAtTip(t *testing.T) {
 	}
 }
 
+func TestChainContinuityBreak(t *testing.T) {
+	// Test that a chain break is detected
+	blocks := generateMockBlocks(5)
+	// Corrupt block 3: set previous_block to a wrong hash
+	block3 := blocks[3]
+	var wrongHash types.Hash
+	wrongHash[0] = 0xFF
+	block3.PreviousBlock = wrongHash
+
+	fetcher := &mockFetcher{blocks: blocks, height: 4}
+	val := validator.NewValidator()
+	cpStore := NewCheckpointStore(t.TempDir())
+	gv := NewGenesisVerifier(fetcher, cpStore, val, 1)
+
+	result, err := gv.Verify(context.Background(), 0, 4, true)
+	if err != nil {
+		t.Fatalf("Verify unexpected error: %v", err)
+	}
+	// Should fail at height 3 with chain continuity error
+	if result.FailedReason == "" {
+		t.Fatal("expected chain continuity failure, but got success")
+	}
+	t.Logf("Correctly detected chain break: %s", result.FailedReason)
+}
+
 func TestGenesisVerifyWithHTTPServer(t *testing.T) {
 	blocks := generateMockBlocks(20)
 
@@ -312,3 +314,6 @@ func TestGenesisVerifyConcurrentWorkers(t *testing.T) {
 		})
 	}
 }
+
+// Ensure rand is used (for mock block generation)
+var _ = rand.New

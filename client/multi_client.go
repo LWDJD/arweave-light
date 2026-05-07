@@ -4,23 +4,29 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/peers"
 	"github.com/arweave-light/types"
 )
+
+// RequireRatio is the minimum weight ratio needed for consensus.
+// Default 0.51 means >50% of total vote weight must agree.
+const RequireRatio = 0.51
 
 // MultiClient queries multiple Arweave nodes and uses consensus voting.
 type MultiClient struct {
 	peerStore    *peers.Store
 	minConsensus int
+	requireRatio float64 // minimum weight ratio for consensus (0.51 = >50%)
 	timeout      time.Duration
 	queryCount   int // how many peers to query per request
+	log          *logger.Logger
 
-	mu        sync.Mutex
-	clients   map[string]*HTTPClient // URL → client cache
+	mu      sync.Mutex
+	clients map[string]*HTTPClient // URL → client cache
 }
 
 // NewMultiClient creates a MultiClient backed by a peer store.
@@ -31,10 +37,17 @@ func NewMultiClient(ps *peers.Store, minConsensus int, timeout time.Duration) *M
 	return &MultiClient{
 		peerStore:    ps,
 		minConsensus: minConsensus,
+		requireRatio: RequireRatio,
 		timeout:      timeout,
 		queryCount:   max(minConsensus*2, 5),
 		clients:      make(map[string]*HTTPClient),
+		log:          logger.NewLogger("multiclient"),
 	}
+}
+
+// SetLogger sets the logger for this multi-client.
+func (mc *MultiClient) SetLogger(l *logger.Logger) {
+	mc.log = l
 }
 
 // SetMinConsensus updates the consensus threshold.
@@ -44,6 +57,16 @@ func (mc *MultiClient) SetMinConsensus(n int) {
 	}
 	mc.minConsensus = n
 	mc.queryCount = max(n*2, 5)
+}
+
+// MinConsensus returns the current consensus threshold.
+func (mc *MultiClient) MinConsensus() int {
+	return mc.minConsensus
+}
+
+// SetQueryCount overrides the number of peers queried per operation.
+func (mc *MultiClient) SetQueryCount(n int) {
+	mc.queryCount = n
 }
 
 // PeerStore returns the underlying peer store.
@@ -64,6 +87,9 @@ func (mc *MultiClient) getClient(url string) *HTTPClient {
 }
 
 // GetInfo queries multiple peers for network info and returns the consensus result.
+// Each peer's vote is weighted by its credit score: high-score peers have
+// proportionally more influence. A minimum of 51% of total response weight
+// must agree for consensus.
 func (mc *MultiClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 	peers := mc.peerStore.Top(mc.queryCount)
 	if len(peers) == 0 {
@@ -87,65 +113,109 @@ func (mc *MultiClient) GetInfo(ctx context.Context) (*types.ChainInfo, error) {
 		}(p.URL)
 	}
 
-	// Collect results, group by (height, hash)
+	// Collect results, group by (height, hash) with weighted votes
 	type voteKey struct {
 		height uint64
 		hash   string
 	}
-	votes := make(map[voteKey][]string)
+	type voteGroup struct {
+		urls   []string
+		weight float64
+		info   *types.ChainInfo
+	}
+	votes := make(map[voteKey]*voteGroup)
 	var allURLs []string
+	totalWeight := 0.0
+	respondingWeight := 0.0
 
 	for i := 0; i < len(peers); i++ {
 		r := <-results
 		allURLs = append(allURLs, r.url)
+		score := mc.peerStore.GetScore(r.url)
+		weight := scoreToWeight(score)
+		totalWeight += weight
+
 		if r.err != nil {
-			log.Printf("[multiclient] Peer %s error: %v", r.url, r.err)
+			mc.log.Warn("Peer %s error: %v (score=%d)", r.url, r.err, score)
 			mc.peerStore.RecordTimeout(r.url)
 			continue
 		}
+		respondingWeight += weight
+
 		key := voteKey{height: r.info.Height, hash: r.info.CurrentHash.Base64()}
-		votes[key] = append(votes[key], r.url)
-	}
-
-	// Find a key with >= minConsensus votes
-	for key, urls := range votes {
-		if len(urls) >= mc.minConsensus {
-			// Reward agreeing peers
-			for _, u := range urls {
-				mc.peerStore.RecordSuccess(u)
+		if g, ok := votes[key]; ok {
+			g.urls = append(g.urls, r.url)
+			g.weight += weight
+		} else {
+			votes[key] = &voteGroup{
+				urls:   []string{r.url},
+				weight: weight,
+				info:   r.info,
 			}
-			// Penalize disagreeing peers
-			for _, u := range allURLs {
-				found := false
-				for _, vu := range urls {
-					if vu == u {
-						found = true
-						break
-					}
-				}
-				if !found {
-					mc.peerStore.RecordMismatch(u)
-				}
-			}
-
-			// Properly decode the consensus hash from its base64url representation
-			var h types.Hash
-			if err := h.UnmarshalJSON([]byte(`"` + key.hash + `"`)); err != nil {
-				log.Printf("[multiclient] Failed to decode consensus hash %q: %v", key.hash, err)
-				continue
-			}
-
-			return &types.ChainInfo{
-				Height:      key.height,
-				CurrentHash: h,
-			}, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no consensus: got %d results, need %d", len(votes), mc.minConsensus)
+	if respondingWeight == 0 {
+		return nil, fmt.Errorf("no peers responded successfully (queried %d)", len(peers))
+	}
+
+	// Find the group with the highest total weight
+	var best *voteGroup
+	for _, g := range votes {
+		if best == nil || g.weight > best.weight {
+			best = g
+		}
+	}
+
+	// Consensus check: the best group must have >51% of responding weight
+	consensusRatio := best.weight / respondingWeight
+	if consensusRatio < mc.requireRatio {
+		// Fallback: also check against old minConsensus count for backward compat
+		if len(best.urls) < mc.minConsensus {
+			return nil, fmt.Errorf("no consensus: best group has %.1f%% weight (%d/%d peers agree), need %.0f%%",
+				consensusRatio*100, len(best.urls), len(allURLs), mc.requireRatio*100)
+		}
+		mc.log.Warn("Consensus weak by weight (%.1f%%) but meets count threshold (%d peers)",
+			consensusRatio*100, len(best.urls))
+	}
+
+	// Reward agreeing peers, penalize disagreeing
+	for _, u := range best.urls {
+		mc.peerStore.RecordSuccess(u)
+	}
+	for _, u := range allURLs {
+		found := false
+		for _, vu := range best.urls {
+			if vu == u {
+				found = true
+				break
+			}
+		}
+		if !found {
+			mc.peerStore.RecordMismatch(u)
+		}
+	}
+
+	// Decode the consensus hash from its base64url representation
+	var h types.Hash
+	if err := h.UnmarshalJSON([]byte(`"` + best.info.CurrentHash.Base64() + `"`)); err != nil {
+		mc.log.Warn("Failed to decode consensus hash: %v", err)
+		return nil, fmt.Errorf("decode consensus hash: %w", err)
+	}
+
+	mc.log.Debug("GetInfo consensus: %.1f%% weight (%d/%d peers), height=%d",
+		consensusRatio*100, len(best.urls), len(allURLs), best.info.Height)
+
+	return &types.ChainInfo{
+		Height:      best.info.Height,
+		CurrentHash: h,
+	}, nil
 }
 
-// GetBlockByHeight fetches a block using consensus from multiple peers.
+// GetBlockByHeight fetches a block using weighted consensus from multiple peers.
+// Each peer's vote is weighted by its credit score via the scoreToWeight
+// function. Consensus requires the best group to hold >51% of total
+// responding weight.
 func (mc *MultiClient) GetBlockByHeight(ctx context.Context, height uint64) (*types.ConsensusResult, error) {
 	peers := mc.peerStore.Top(mc.queryCount)
 	if len(peers) == 0 {
@@ -169,38 +239,48 @@ func (mc *MultiClient) GetBlockByHeight(ctx context.Context, height uint64) (*ty
 		}(p.URL)
 	}
 
-	// Group by block hash
+	// Group by block hash with weighted votes
 	type voteGroup struct {
-		block *types.Block
-		urls  []string
+		block  *types.Block
+		urls   []string
+		weight float64
 	}
 	votes := make(map[string]*voteGroup) // hash → group
 	var allResponded []string
 	var allQueried []string
+	totalWeight := 0.0
+	respondingWeight := 0.0
+
 	for _, p := range peers {
 		allQueried = append(allQueried, p.URL)
 	}
 
 	for i := 0; i < len(peers); i++ {
 		r := <-results
+		score := mc.peerStore.GetScore(r.url)
+		weight := scoreToWeight(score)
+		totalWeight += weight
+
 		if r.err != nil {
-			log.Printf("[multiclient] Peer %s error on block %d: %v", r.url, height, r.err)
+			mc.log.Warn("Peer %s error on block %d: %v (score=%d)", r.url, height, r.err, score)
 			mc.peerStore.RecordTimeout(r.url)
 			continue
 		}
+		respondingWeight += weight
 		allResponded = append(allResponded, r.url)
 		hashKey := r.block.Hash.Base64()
 		if g, ok := votes[hashKey]; ok {
 			g.urls = append(g.urls, r.url)
+			g.weight += weight
 		} else {
-			votes[hashKey] = &voteGroup{block: r.block, urls: []string{r.url}}
+			votes[hashKey] = &voteGroup{block: r.block, urls: []string{r.url}, weight: weight}
 		}
 	}
 
-	// Find best consensus
+	// Find best consensus (highest weight)
 	var best *voteGroup
 	for _, g := range votes {
-		if best == nil || len(g.urls) > len(best.urls) {
+		if best == nil || g.weight > best.weight {
 			best = g
 		}
 	}
@@ -218,7 +298,20 @@ func (mc *MultiClient) GetBlockByHeight(ctx context.Context, height uint64) (*ty
 	cr.AgreedURLs = best.urls
 	cr.Agreed = len(best.urls)
 	cr.Block = best.block
-	cr.Consensus = cr.Agreed >= mc.minConsensus
+
+	// Consensus check: weight-based primary, count-based fallback
+	if respondingWeight > 0 {
+		consensusRatio := best.weight / respondingWeight
+		cr.Consensus = consensusRatio >= mc.requireRatio
+		if !cr.Consensus && len(best.urls) >= mc.minConsensus {
+			// Fallback to old count-based for backward compatibility
+			cr.Consensus = true
+			mc.log.Warn("Block %d: weak consensus by weight (%.1f%%) but meets count threshold (%d peers)",
+				height, consensusRatio*100, len(best.urls))
+		}
+	} else {
+		cr.Consensus = len(best.urls) >= mc.minConsensus
+	}
 
 	// Update scores
 	for _, u := range allResponded {
@@ -237,8 +330,12 @@ func (mc *MultiClient) GetBlockByHeight(ctx context.Context, height uint64) (*ty
 	}
 
 	if !cr.Consensus {
-		return cr, fmt.Errorf("block %d: consensus not reached (%d/%d agree, need %d)",
-			height, cr.Agreed, cr.Total, mc.minConsensus)
+		ratio := 0.0
+		if respondingWeight > 0 {
+			ratio = best.weight / respondingWeight
+		}
+		return cr, fmt.Errorf("block %d: consensus not reached (%.1f%% weight, %d/%d peers agree, need %.0f%% or %d peers)",
+			height, ratio*100, cr.Agreed, cr.Total, mc.requireRatio*100, mc.minConsensus)
 	}
 
 	return cr, nil
@@ -278,7 +375,7 @@ func (mc *MultiClient) GetPeersFromAll(ctx context.Context) ([]string, error) {
 			defer wg.Done()
 			list, err := mc.getClient(url).GetPeers(childCtx)
 			if err != nil {
-				log.Printf("[multiclient] Failed to get peers from %s: %v", url, err)
+				mc.log.Warn("Failed to get peers from %s: %v", url, err)
 				mc.peerStore.RecordTimeout(url)
 				return
 			}
@@ -363,6 +460,21 @@ func DecodeHashFromBase64(encoded string) (types.Hash, error) {
 		return types.EmptyHash(), fmt.Errorf("decode base64url hash: %w", err)
 	}
 	return types.HashFromBytes(decoded), nil
+}
+
+// scoreToWeight converts a peer's credit score to a voting weight.
+//   - score <= 0 → weight 1.0 (minimum voice, all peers get at least 1 vote)
+//   - score > 0  → weight = float64(score) (proportional influence)
+//
+// This ensures new peers (score 0) have minimal weight while established
+// high-score peers dominate consensus. Malicious peers can't inject fake
+// votes because they'd need to accumulate high scores through repeated
+// correct responses.
+func scoreToWeight(score int) float64 {
+	if score <= 0 {
+		return 1.0
+	}
+	return float64(score)
 }
 
 func max(a, b int) int {

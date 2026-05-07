@@ -2,14 +2,17 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/arweave-light/client"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/peers"
 	"github.com/arweave-light/store"
 	"github.com/arweave-light/syncer"
@@ -20,41 +23,74 @@ import (
 // Config holds the node configuration.
 type Config struct {
 	DataDir        string
-	PeerURL        string // legacy, kept for backwards compat
+	PeerURL        string // fallback single peer (arweave.net)
 	HTTPTimeout    time.Duration
 	SyncEnabled    bool
 	ValidateBlocks bool
 	SyncerConfig   syncer.Config
 
-	// New peer-discovery fields
-	Bootstrap     string // bootstrap peer URL (first run)
-	AddPeer       string // manual peer addition
-	ListPeers     bool   // print peer list and exit
-	MinConsensus  int    // minimum agreeing peers for consensus
+	// Peer-discovery
+	Bootstrap     string
+	AddPeer       string
+	ListPeers     bool
+	SecurityLevel string // "low" or "high" — controls consensus quorum size
 }
+
+// SecurityLevel constants
+const (
+	SecurityLow  = "low"
+	SecurityHigh = "high"
+)
+
+// SecurityLevelConfig maps a security level to MultiClient parameters.
+type SecurityLevelConfig struct {
+	QueryCount   int
+	MinConsensus int
+}
+
+// SecurityLevels defines the parameters for each security level.
+var SecurityLevels = map[string]SecurityLevelConfig{
+	SecurityLow:  {QueryCount: 5, MinConsensus: 3},
+	SecurityHigh: {QueryCount: 20, MinConsensus: 3},
+}
+
+// TrustedSeeds is a list of known stable Arweave peer addresses compiled
+// into the binary. These are used to bootstrap the peer pool on first run,
+// reducing reliance on a single bootstrap peer (e.g. arweave.net).
+//
+// Selected for long uptime and geographic diversity. Updated periodically.
+var TrustedSeeds = []string{
+	"https://arweave.net",
+}
+
+// TrustedSeedScore is the initial score assigned to trusted seed nodes.
+// This gives them higher voting weight from the start, as they are
+// pre-vetted stable nodes.
+const TrustedSeedScore = 3
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		DataDir:        "./arweave-light-data",
+		DataDir:        "./ar-data",
 		PeerURL:        "https://arweave.net",
 		HTTPTimeout:    30 * time.Second,
 		SyncEnabled:    true,
 		ValidateBlocks: true,
 		SyncerConfig:   syncer.DefaultConfig(),
-		MinConsensus:   3,
+		SecurityLevel:  SecurityHigh,
 	}
 }
 
 // Node is the main coordinator.
 type Node struct {
 	cfg        Config
+	log        *logger.Logger
 	db         *store.DB
 	peerStore  *peers.Store
 	mc         *client.MultiClient
 	validator  *validator.Validator
 	syncer     *syncer.Syncer
-	singlePeer *client.HTTPClient // legacy single peer client, for direct queries
+	singlePeer *client.HTTPClient
 
 	mu       sync.RWMutex
 	running  bool
@@ -64,6 +100,8 @@ type Node struct {
 
 	startTime  time.Time
 	blocksSeen uint64
+
+	checkpointPath string
 }
 
 // Event represents something that happened in the node.
@@ -84,8 +122,10 @@ const (
 // New creates a new Node instance.
 func New(cfg Config) (*Node, error) {
 	n := &Node{
-		cfg:     cfg,
-		eventCh: make(chan Event, 1000),
+		cfg:            cfg,
+		log:            logger.NewLogger("node"),
+		eventCh:        make(chan Event, 1000),
+		checkpointPath: filepath.Join(cfg.DataDir, "checkpoint.json"),
 	}
 
 	// Open database
@@ -98,15 +138,25 @@ func New(cfg Config) (*Node, error) {
 	// Init peer store
 	peersPath := filepath.Join(cfg.DataDir, "peers.json")
 	n.peerStore = peers.NewStore(peersPath)
+	n.peerStore.SetLogger(logger.NewLogger("peers"))
 
-	// Keep legacy single-peer client for direct queries
+	// Load persisted peers so query-mode commands (--info, etc.) can use them
+	// without needing to call Start(). The Load() method handles missing files gracefully.
+	if err := n.peerStore.Load(); err != nil {
+		n.log.Warn("Failed to load peers from %s: %v", peersPath, err)
+	}
+
+	// Keep single-peer client for fallback queries (height-only, no data trust)
 	n.singlePeer = client.NewHTTPClient(cfg.PeerURL, cfg.HTTPTimeout)
 
 	// Multi-client for consensus-based operations
-	if cfg.MinConsensus < 1 {
-		cfg.MinConsensus = 1
+	secCfg, ok := SecurityLevels[cfg.SecurityLevel]
+	if !ok {
+		secCfg = SecurityLevels[SecurityHigh] // fallback to high
 	}
-	n.mc = client.NewMultiClient(n.peerStore, cfg.MinConsensus, cfg.HTTPTimeout)
+	n.mc = client.NewMultiClient(n.peerStore, secCfg.MinConsensus, cfg.HTTPTimeout)
+	n.mc.SetLogger(logger.NewLogger("multiclient"))
+	n.mc.SetQueryCount(secCfg.QueryCount)
 
 	if cfg.ValidateBlocks {
 		n.validator = validator.NewValidator()
@@ -127,13 +177,14 @@ func (n *Node) Start(ctx context.Context) error {
 	ctx, n.cancelFn = context.WithCancel(ctx)
 	n.mu.Unlock()
 
-	log.Printf("[node] Starting arweave-light node (multi-peer)")
-	log.Printf("[node] Data directory: %s", n.cfg.DataDir)
-	log.Printf("[node] Min consensus: %d", n.cfg.MinConsensus)
+	n.log.Info("Starting arweave-light (pure decentralized sync)")
+	n.log.Info("Data directory: %s", n.cfg.DataDir)
+	secCfg := SecurityLevels[n.cfg.SecurityLevel]
+	n.log.Info("Security level: %s (query %d peers, min %d agree)", n.cfg.SecurityLevel, secCfg.QueryCount, secCfg.MinConsensus)
 
 	// ---- Peer discovery lifecycle ----
 	if err := n.peerDiscovery(ctx); err != nil {
-		log.Printf("[node] WARNING: peer discovery: %v", err)
+		n.log.Warn("Peer discovery: %v", err)
 	}
 
 	// ---- Print peer list if requested ----
@@ -145,60 +196,94 @@ func (n *Node) Start(ctx context.Context) error {
 	if n.cfg.AddPeer != "" {
 		n.peerStore.Add(n.cfg.AddPeer)
 		if err := n.peerStore.Save(); err != nil {
-			log.Printf("[node] Failed to save peers: %v", err)
+			n.log.Warn("Failed to save peers: %v", err)
 		}
-		log.Printf("[node] Manually added peer: %s", n.cfg.AddPeer)
+		n.log.Info("Manually added peer: %s", n.cfg.AddPeer)
 	}
 
 	// Check connectivity to best peers
 	topPeers := n.peerStore.Top(5)
 	if len(topPeers) > 0 {
-		log.Printf("[node] Testing connectivity to top %d peers...", len(topPeers))
+		n.log.Info("Testing connectivity to top %d peers...", len(topPeers))
 		for _, p := range topPeers {
 			if err := n.mc.Ping(ctx, p.URL); err != nil {
-				log.Printf("[node]   %s → unreachable: %v", p.URL, err)
+				n.log.Warn("  %s → unreachable: %v", p.URL, err)
 				n.peerStore.RecordTimeout(p.URL)
 			} else {
-				log.Printf("[node]   %s → OK (score=%d)", p.URL, p.Score)
+				n.log.Info("  %s → OK (score=%d)", p.URL, p.Score)
 				n.peerStore.RecordSuccess(p.URL)
 			}
 		}
 		n.peerStore.Save()
 	}
 
-	// Get network info
-	info, err := n.mc.GetInfo(ctx)
+	// If we still have too few peers after bootstrap, immediately try to refresh
+	if n.peerStore.Len() < secCfg.MinConsensus*2 {
+		go func() {
+			time.Sleep(2 * time.Second) // wait for bootstrap peers to stabilize
+			n.log.Info("Attempting immediate peer refresh (only %d peers)", n.peerStore.Len())
+			newURLs, err := n.mc.GetPeersFromAll(ctx)
+			if err != nil {
+				n.log.Warn("Immediate peer refresh failed: %v", err)
+				return
+			}
+			added := n.peerStore.AddPeers(newURLs)
+			if added > 0 {
+				n.log.Info("Immediate refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
+				n.peerStore.Save()
+			}
+		}()
+	}
+
+	// ---- Load persisted checkpoint ----
+	cp := n.loadCheckpoint()
+	if cp != nil {
+		n.log.Info("Loaded checkpoint: height=%d indep_hash=%s",
+			cp.Height, cp.IndepHash.String()[:16])
+	}
+
+	// Get network info for display
+	netHeight, err := n.fetchNetworkHeight(ctx)
 	if err != nil {
-		log.Printf("[node] WARNING: cannot get network info via consensus: %v", err)
-		// Fall back to single peer
-		if info2, err2 := n.singlePeer.GetInfo(ctx); err2 == nil {
-			info = info2
-			log.Printf("[node] Fallback to single peer: height=%d", info.Height)
+		n.log.Warn("Cannot get network height: %v", err)
+	} else {
+		localInfo, _ := n.db.GetChainInfo()
+		localH := uint64(0)
+		if localInfo != nil {
+			localH = localInfo.Height
 		}
-	}
-	if info != nil {
-		log.Printf("[node] Network height: %d, current hash: %s", info.Height, info.CurrentHash)
+		if cp != nil {
+			localH = cp.Height
+		}
+		n.log.Info("Network height: %d, local checkpoint: %d", netHeight, localH)
 	}
 
-	// Start syncer
-	if n.syncer == nil && n.cfg.SyncEnabled {
-		n.syncer = syncer.NewSyncer(n.db, n.mc, n.validator, n.cfg.SyncerConfig)
+	// ---- Start syncer ----
+	if n.cfg.SyncEnabled {
+		sCfg := n.cfg.SyncerConfig
+		sCfg.ConsensusMode = n.cfg.SecurityLevel != "" // consensus enabled if security level set
+		n.syncer = syncer.NewSyncer(n.db, n.mc, n.singlePeer, n.validator, sCfg)
 		n.syncer.SetCallbacks(n.onBlock, n.onSyncComplete)
-	}
+		n.syncer.OnCheckpointSet(func(cp *syncer.TrustedCheckpoint) {
+			n.saveCheckpoint(cp)
+		})
 
-	if n.syncer != nil {
+		if cp != nil {
+			n.syncer.SetCheckpoint(cp)
+		}
+
 		go func() {
 			if err := n.syncer.SyncToTip(ctx); err != nil {
 				if !errors.Is(err, context.Canceled) {
-					log.Printf("[node] Sync error: %v", err)
+					n.log.Error("Sync error: %v", err)
 					n.emitEvent(EventError, err.Error())
 				}
 			}
 		}()
 	}
 
-	// Start periodic peer refresh
-	go n.peerRefreshLoop(ctx)
+	// Start continuous peer discovery loop (independent goroutine)
+	go n.peerDiscoveryLoop(ctx)
 
 	return nil
 }
@@ -209,21 +294,52 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 		return fmt.Errorf("load peers: %w", err)
 	}
 
-	if n.peerStore.Len() == 0 {
-		// No peers file yet — first run
-		return n.bootstrap(ctx)
+	// Always add trusted seeds on first start (score 0 means not yet connected)
+	if n.peerStore.Len() == 0 || !n.hasTrustedSeeds() {
+		n.addTrustedSeeds()
 	}
 
-	log.Printf("[node] Loaded %d peers from %s", n.peerStore.Len(),
+	// Bootstrap if we have no peers or fewer than the security level's minimum
+	secCfg := SecurityLevels[n.cfg.SecurityLevel]
+	if n.peerStore.Len() == 0 || n.peerStore.Len() < secCfg.MinConsensus {
+		n.log.Info("Too few peers (%d < %d), bootstrapping...", n.peerStore.Len(), secCfg.MinConsensus)
+		if err := n.bootstrap(ctx); err != nil {
+			n.log.Warn("Bootstrap failed: %v", err)
+		}
+	}
+
+	n.log.Info("Loaded %d peers from %s", n.peerStore.Len(),
 		filepath.Join(n.cfg.DataDir, "peers.json"))
 	return nil
+}
+
+// hasTrustedSeeds checks if any trusted seed is already in the peer store.
+func (n *Node) hasTrustedSeeds() bool {
+	for _, seed := range TrustedSeeds {
+		if n.peerStore.Get(seed) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// addTrustedSeeds adds compiled-in trusted seed nodes with elevated initial scores.
+func (n *Node) addTrustedSeeds() {
+	for _, seed := range TrustedSeeds {
+		p, isNew := n.peerStore.Add(seed)
+		if isNew && p != nil {
+			// Give trusted seeds a higher initial score so they carry more
+			// voting weight from the start.
+			p.Score = TrustedSeedScore
+			n.log.Info("Added trusted seed: %s (initial score=%d)", seed, TrustedSeedScore)
+		}
+	}
 }
 
 // bootstrap connects to a bootstrap peer to discover other peers.
 func (n *Node) bootstrap(ctx context.Context) error {
 	bootstrapURL := n.cfg.Bootstrap
 	if bootstrapURL == "" {
-		// Fall back to the legacy peer URL as bootstrap
 		bootstrapURL = n.cfg.PeerURL
 	}
 
@@ -231,67 +347,132 @@ func (n *Node) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("no bootstrap peer configured (use --bootstrap)")
 	}
 
-	log.Printf("[node] First run: bootstrapping from %s", bootstrapURL)
+	n.log.Info("First run: bootstrapping from %s", bootstrapURL)
 
-	// Add bootstrap as a regular peer
 	n.peerStore.Add(bootstrapURL)
 	n.peerStore.RecordSuccess(bootstrapURL)
 
-	// Fetch peer list from bootstrap
 	bootstrapClient := client.NewHTTPClient(bootstrapURL, n.cfg.HTTPTimeout)
 	peerURLs, err := bootstrapClient.GetPeers(ctx)
 	if err != nil {
-		log.Printf("[node] Failed to get peers from bootstrap: %v", err)
-		// Still save the bootstrap peer alone
+		n.log.Warn("Failed to get peers from bootstrap: %v", err)
 		return n.peerStore.Save()
 	}
 
-	log.Printf("[node] Bootstrap returned %d peers", len(peerURLs))
-
-	// Merge into store
+	n.log.Info("Bootstrap returned %d peers", len(peerURLs))
 	added := n.peerStore.AddPeers(peerURLs)
-	log.Printf("[node] Added %d new peers (total: %d)", added, n.peerStore.Len())
+	n.log.Info("Added %d new peers (total: %d)", added, n.peerStore.Len())
 
-	// Bootstrap is now just a regular peer — no special handling
 	return n.peerStore.Save()
 }
 
-// peerRefreshLoop periodically fetches updated peer lists.
-func (n *Node) peerRefreshLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
+// peerDiscoveryLoop is a continuous goroutine that discovers new peers.
+//
+// Each round:
+//  1. Randomly selects 1–3 known peers
+//  2. Queries each for their /peers list, one at a time
+//  3. On failure → immediately tries the next peer (no sleep)
+//  4. On first success → adds discovered peers, round ends
+//  5. If all fail → tries a new random batch (up to maxAttempts)
+//  6. Waits 10 seconds after round completes, then repeats
+func (n *Node) peerDiscoveryLoop(ctx context.Context) {
+	n.log.Info("Starting continuous peer discovery loop")
+	const maxAttempts = 5
 
 	for {
 		select {
 		case <-ctx.Done():
+			n.log.Info("Peer discovery loop stopped")
 			return
-		case <-ticker.C:
-			log.Printf("[node] Refreshing peer list...")
-			newURLs, err := n.mc.GetPeersFromAll(ctx)
-			if err != nil {
-				log.Printf("[node] Peer refresh failed: %v", err)
+		default:
+		}
+
+		discovered := false
+		for attempts := 0; attempts < maxAttempts; attempts++ {
+			// Pick 1-3 random peers
+			count := rand.Intn(3) + 1
+			peerList := n.peerStore.Random(count)
+			if len(peerList) == 0 {
+				n.log.Debug("Peer discovery: no peers available, retrying in 2s")
+				time.Sleep(2 * time.Second)
 				continue
 			}
-			added := n.peerStore.AddPeers(newURLs)
-			if added > 0 {
-				log.Printf("[node] Peer refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
-				n.peerStore.Save()
-			} else {
-				log.Printf("[node] Peer refresh: no new peers found")
+
+			for _, p := range peerList {
+				select {
+				case <-ctx.Done():
+					n.log.Info("Peer discovery loop stopped")
+					return
+				default:
+				}
+
+				newPeers, err := n.fetchPeersFrom(ctx, p.URL)
+				if err != nil {
+					n.log.Debug("Peer discovery: %s failed: %v", p.URL, err)
+					n.peerStore.RecordTimeout(p.URL)
+					continue // immediately try next peer
+				}
+
+				if len(newPeers) > 0 {
+					added := n.peerStore.AddPeers(newPeers)
+					if added > 0 {
+						n.log.Info("Peer discovery: added %d new peers from %s (total: %d)", added, p.URL, n.peerStore.Len())
+						n.peerStore.Save()
+						n.peerStore.RecordSuccess(p.URL)
+					}
+				}
+				discovered = true
+				break // success → end this batch
 			}
+
+			if discovered {
+				break // end attempts
+			}
+			// All peers in this batch failed — retry immediately with new random batch
+		}
+
+		if !discovered {
+			n.log.Debug("Peer discovery: no peers found in this round")
+		}
+
+		// Round complete → wait 10 seconds before next round
+		select {
+		case <-ctx.Done():
+			n.log.Info("Peer discovery loop stopped")
+			return
+		case <-time.After(10 * time.Second):
 		}
 	}
 }
 
+// fetchPeersFrom queries a single peer's /peers endpoint.
+func (n *Node) fetchPeersFrom(ctx context.Context, url string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, n.cfg.HTTPTimeout)
+	defer cancel()
+
+	hc := n.mc.SingleClient(url)
+	rawPeers, err := hc.GetPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize all peer URLs
+	normalized := make([]string, 0, len(rawPeers))
+	for _, p := range rawPeers {
+		normalized = append(normalized, peers.NormalizePeerURL(p))
+	}
+	return normalized, nil
+}
+
 func (n *Node) printPeers() {
 	all := n.peerStore.GetAll()
-	log.Printf("[node] ---- Peer List (%d) ----", len(all))
+	n.log.Info("---- Peer List (%d) ----", len(all))
 	for i, p := range all {
-		log.Printf("  %2d. %s  score=%d  success=%d  fail=%d  last=%s",
+		n.log.Info("  %2d. %s  score=%d  success=%d  fail=%d  last=%s",
 			i+1, p.URL, p.Score, p.SuccessCount, p.FailCount,
 			p.LastConnected.Format("2006-01-02 15:04:05"))
 	}
-	log.Printf("[node] -------------------------")
+	n.log.Info("-------------------------")
 }
 
 // Stop gracefully shuts down the node.
@@ -307,15 +488,14 @@ func (n *Node) Stop() error {
 	}
 	n.mu.Unlock()
 
-	log.Printf("[node] Shutting down...")
+	n.log.Info("Shutting down...")
 
 	if n.syncer != nil {
 		n.syncer.Cancel()
 	}
 
-	// Save peer state
 	if err := n.peerStore.Save(); err != nil {
-		log.Printf("[node] Failed to save peers: %v", err)
+		n.log.Warn("Failed to save peers: %v", err)
 	}
 
 	if err := n.db.Close(); err != nil {
@@ -323,7 +503,7 @@ func (n *Node) Stop() error {
 	}
 
 	close(n.eventCh)
-	log.Printf("[node] Node stopped")
+	n.log.Info("Node stopped")
 	return nil
 }
 
@@ -375,13 +555,23 @@ func (n *Node) GetChainInfo() (*types.ChainInfo, error) {
 	return n.db.GetChainInfo()
 }
 
-// FetchBlockByHeight fetches a block from the network by height (through single peer).
+// FetchBlockByHeight fetches a block from the network by height.
 func (n *Node) FetchBlockByHeight(ctx context.Context, height uint64) (*types.Block, error) {
 	return n.singlePeer.GetBlockByHeight(ctx, height)
 }
 
 // FetchNetworkHeight returns the current network height.
 func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
+	return n.fetchNetworkHeight(ctx)
+}
+
+func (n *Node) fetchNetworkHeight(ctx context.Context) (uint64, error) {
+	if n.cfg.SecurityLevel != "" && n.peerStore.Len() > 0 {
+		info, err := n.mc.GetInfo(ctx)
+		if err == nil {
+			return info.Height, nil
+		}
+	}
 	info, err := n.singlePeer.GetInfo(ctx)
 	if err != nil {
 		return 0, err
@@ -391,12 +581,13 @@ func (n *Node) FetchNetworkHeight(ctx context.Context) (uint64, error) {
 
 // GetNetworkInfo returns info from the peer network.
 func (n *Node) GetNetworkInfo(ctx context.Context) (*types.ChainInfo, error) {
-	info, err := n.mc.GetInfo(ctx)
-	if err != nil {
-		// Fall back to single peer
-		return n.singlePeer.GetInfo(ctx)
+	if n.cfg.SecurityLevel != "" && n.peerStore.Len() > 0 {
+		info, err := n.mc.GetInfo(ctx)
+		if err == nil {
+			return info, nil
+		}
 	}
-	return info, nil
+	return n.singlePeer.GetInfo(ctx)
 }
 
 // GetSyncStatus returns the current sync status.
@@ -404,7 +595,21 @@ func (n *Node) GetSyncStatus() types.SyncStatus {
 	if n.syncer != nil {
 		return n.syncer.Status()
 	}
-	return types.SyncStatus{}
+	cp := n.loadCheckpoint()
+	info, _ := n.db.GetChainInfo()
+	h := uint64(0)
+	if cp != nil {
+		h = cp.Height
+	}
+	if info != nil && info.Height > h {
+		h = info.Height
+	}
+	return types.SyncStatus{
+		Syncing:       false,
+		CurrentHeight: h,
+		TargetHeight:  0,
+		BlocksBehind:  0,
+	}
 }
 
 // SyncToTip triggers a manual sync.
@@ -429,7 +634,7 @@ func (n *Node) GetPeers(ctx context.Context) ([]string, error) {
 	return n.peerStore.URLs(), nil
 }
 
-// GetValidator returns the node's validator (for genesis verification, etc.).
+// GetValidator returns the node's validator.
 func (n *Node) GetValidator() *validator.Validator {
 	return n.validator
 }
@@ -457,20 +662,82 @@ func (n *Node) Stats() map[string]interface{} {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
-	info, _ := n.db.GetChainInfo()
+	cp := n.loadCheckpoint()
 	height := uint64(0)
-	if info != nil {
+	if cp != nil {
+		height = cp.Height
+	}
+	info, _ := n.db.GetChainInfo()
+	if info != nil && info.Height > height {
 		height = info.Height
 	}
 
 	return map[string]interface{}{
-		"running":      n.running,
-		"uptime":       time.Since(n.startTime).String(),
-		"height":       height,
-		"blocks_seen":  n.blocksSeen,
-		"peer_count":   n.peerStore.Len(),
-		"peer":         n.cfg.PeerURL,
-		"min_consensus": n.cfg.MinConsensus,
+		"running":       n.running,
+		"uptime":        time.Since(n.startTime).String(),
+		"height":        height,
+		"blocks_seen":   n.blocksSeen,
+		"peer_count":    n.peerStore.Len(),
+		"peer":          n.cfg.PeerURL,
+		"security_level": n.cfg.SecurityLevel,
+	}
+}
+
+// ---- checkpoint persistence ----
+
+type checkpointFile struct {
+	Height    uint64 `json:"height"`
+	IndepHash string `json:"indep_hash"`
+	BlockHash string `json:"block_hash"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+func (n *Node) loadCheckpoint() *syncer.TrustedCheckpoint {
+	data, err := os.ReadFile(n.checkpointPath)
+	if err != nil {
+		return nil
+	}
+	var cf checkpointFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil
+	}
+	var indepHash types.Hash
+	if err := indepHash.UnmarshalJSON([]byte(`"` + cf.IndepHash + `"`)); err != nil {
+		return nil
+	}
+	var blockHash types.Hash
+	if err := blockHash.UnmarshalJSON([]byte(`"` + cf.BlockHash + `"`)); err != nil {
+		// block_hash may be empty for old checkpoints
+		blockHash = types.EmptyHash()
+	}
+	return &syncer.TrustedCheckpoint{
+		Height:    cf.Height,
+		IndepHash: indepHash,
+		BlockHash: blockHash,
+		Timestamp: cf.Timestamp,
+	}
+}
+
+func (n *Node) saveCheckpoint(cp *syncer.TrustedCheckpoint) {
+	cf := checkpointFile{
+		Height:    cp.Height,
+		IndepHash: cp.IndepHash.Base64(),
+		BlockHash: cp.BlockHash.Base64(),
+		Timestamp: cp.Timestamp,
+	}
+	data, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		n.log.Warn("Failed to marshal checkpoint: %v", err)
+		return
+	}
+	tmpPath := n.checkpointPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		n.log.Warn("Failed to write checkpoint: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, n.checkpointPath); err != nil {
+		n.log.Warn("Failed to rename checkpoint: %v", err)
+		return
 	}
 }
 

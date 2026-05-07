@@ -9,6 +9,39 @@ import (
 	"time"
 )
 
+// FlexString is a string that can be unmarshaled from either a JSON string
+// or a JSON number. Some Arweave nodes return numeric fields (like "diff")
+// as bare numbers instead of strings, which would otherwise break
+// json.Unmarshal into a Go string field.
+type FlexString string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (fs *FlexString) UnmarshalJSON(data []byte) error {
+	// Try string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*fs = FlexString(s)
+		return nil
+	}
+	// Try number (json.Number preserves the original representation)
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err == nil {
+		*fs = FlexString(n.String())
+		return nil
+	}
+	return fmt.Errorf("FlexString: expected string or number, got %s", string(data))
+}
+
+// MarshalJSON implements json.Marshaler.
+func (fs FlexString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(fs))
+}
+
+// String returns the underlying string.
+func (fs FlexString) String() string {
+	return string(fs)
+}
+
 // HashSize is the Arweave native hash size in bytes (see ar.hrl: -define(HASH_SIZE, 48)).
 const HashSize = 48
 
@@ -158,34 +191,35 @@ func (tx *Transaction) ComputeID() error {
 
 // Block represents a lightweight Arweave block.
 type Block struct {
-	Nonce          string `json:"nonce"`
-	PreviousBlock  Hash   `json:"previous_block"`
-	Timestamp      int64  `json:"timestamp"`
-	LastRetarget   int64  `json:"last_retarget"`
-	Diff           string `json:"diff"`
-	Height         uint64 `json:"height"`
-	Hash           Hash   `json:"hash"`
-	IndepHash      Hash   `json:"indep_hash"`
-	Txs            []Hash `json:"txs"`
-	TxRoot         Hash   `json:"tx_root"`
-	WalletList     Hash   `json:"wallet_list"`
-	RewardAddr     string `json:"reward_addr"`
-	Tags           []Tag  `json:"tags"`
-	RewardPool     string `json:"reward_pool"`
-	WeaveSize      string `json:"weave_size"`
-	BlockSize      string `json:"block_size"`
-	CumulativeDiff string `json:"cumulative_diff"`
-	HashListMerkle Hash   `json:"hash_list_merkle"`
+	Nonce          string     `json:"nonce"`
+	PreviousBlock  Hash       `json:"previous_block"`
+	Timestamp      int64      `json:"timestamp"`
+	LastRetarget   int64      `json:"last_retarget"`
+	Diff           FlexString `json:"diff"`
+	Height         uint64     `json:"height"`
+	Hash           Hash       `json:"hash"`
+	IndepHash      Hash       `json:"indep_hash"`
+	Signature      string     `json:"signature,omitempty"`
+	Txs            []Hash     `json:"txs"`
+	TxRoot         Hash       `json:"tx_root"`
+	WalletList     Hash       `json:"wallet_list"`
+	RewardAddr     string     `json:"reward_addr"`
+	Tags           []Tag      `json:"tags"`
+	RewardPool     FlexString `json:"reward_pool"`
+	WeaveSize      FlexString `json:"weave_size"`
+	BlockSize      FlexString `json:"block_size"`
+	CumulativeDiff FlexString `json:"cumulative_diff"`
+	HashListMerkle Hash       `json:"hash_list_merkle"`
 }
 
 // BlockHeader is a minimal block header.
 type BlockHeader struct {
-	Height         uint64 `json:"height"`
-	Hash           Hash   `json:"hash"`
-	PreviousBlock  Hash   `json:"previous_block"`
-	Timestamp      int64  `json:"timestamp"`
-	Diff           string `json:"diff"`
-	CumulativeDiff string `json:"cumulative_diff"`
+	Height         uint64     `json:"height"`
+	Hash           Hash       `json:"hash"`
+	PreviousBlock  Hash       `json:"previous_block"`
+	Timestamp      int64      `json:"timestamp"`
+	Diff           FlexString `json:"diff"`
+	CumulativeDiff FlexString `json:"cumulative_diff"`
 }
 
 // Header extracts a BlockHeader from a Block.
