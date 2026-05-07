@@ -23,6 +23,7 @@ var (
 	ErrInvalidDifficulty    = errors.New("validator: insufficient difficulty")
 	ErrBlockTooOld          = errors.New("validator: block too old")
 	ErrInvalidPreviousBlock = errors.New("validator: previous block hash mismatch")
+	ErrIndepHashMismatch    = errors.New("validator: indep_hash mismatch")
 )
 
 // Validator checks block and transaction validity.
@@ -39,16 +40,16 @@ func NewValidator() *Validator {
 
 // ValidateBlock performs full block validation.
 func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) error {
-	// 1. Verify block hash
-	if err := v.validateBlockHash(block); err != nil {
+	// 1. Verify difficulty (block.Hash must satisfy block.Diff)
+	if err := v.verifyDifficulty(block); err != nil {
 		return err
 	}
 
-	// 2. Check previous block hash
+	// 2. Check previous block hash (chain continuity)
 	if prevBlock != nil {
-		if block.PreviousBlock != prevBlock.Hash {
-			return fmt.Errorf("%w: expected %s, got %s",
-				ErrInvalidPreviousBlock, prevBlock.Hash, block.PreviousBlock)
+		if block.PreviousBlock != prevBlock.IndepHash {
+			return fmt.Errorf("%w: expected previous_block=%s (prev indep_hash), got %s",
+				ErrInvalidPreviousBlock, prevBlock.IndepHash.Base64()[:16], block.PreviousBlock.Base64()[:16])
 		}
 		if block.Height != prevBlock.Height+1 {
 			return fmt.Errorf("validator: invalid height: %d, expected %d",
@@ -69,41 +70,45 @@ func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) er
 	return nil
 }
 
-// validateBlockHash verifies block.Hash matches computed hash.
-func (v *Validator) validateBlockHash(block *types.Block) error {
-	computed := v.computeBlockHash(block)
-	if computed != block.Hash {
-		return fmt.Errorf("%w: computed %s, got %s",
-			ErrInvalidBlockHash, computed, block.Hash)
+// verifyDifficulty checks that block.Hash, interpreted as a big-endian integer,
+// is less than or equal to block.Diff. This is the proof-of-work check.
+func (v *Validator) verifyDifficulty(block *types.Block) error {
+	diff, err := types.BigIntFromString(block.Diff.String())
+	if err != nil {
+		return fmt.Errorf("parse difficulty: %w", err)
+	}
+
+	// block.Hash is a 48-byte array; for mining solution it's SHA-256 (32 meaningful bytes)
+	// Use the full 48-byte representation as big.Int
+	hashBig := new(big.Int).SetBytes(block.Hash[:])
+	if hashBig.Cmp(diff) > 0 {
+		return fmt.Errorf("%w: hash %s > diff %s",
+			ErrInvalidDifficulty, block.Hash.Base64()[:16], block.Diff.String())
 	}
 	return nil
 }
 
-// computeBlockHash computes the block hash per Arweave spec.
-func (v *Validator) computeBlockHash(block *types.Block) types.Hash {
-	hasher := sha256.New()
-
-	write := func(s string) {
-		hasher.Write([]byte(s))
+// ValidateIndepHash verifies the block's indep_hash against chain continuity.
+// For a light node, the indep_hash cannot be independently recomputed
+// (it requires full node internals like nonce_limiter_info and signature),
+// so we verify chain continuity: if prevBlock is provided, current block's
+// previous_block must equal prevBlock's indep_hash.
+//
+// For the bootstrap block (prevBlock == nil), this check is a no-op because
+// the block's indep_hash is verified through multi-peer consensus.
+func (v *Validator) ValidateIndepHash(block *types.Block, prevBlock *types.Block) error {
+	// Chain continuity: this block's previous_block must match the
+	// previous block's indep_hash. This ensures blocks form a valid chain.
+	if prevBlock != nil {
+		if block.PreviousBlock != prevBlock.IndepHash {
+			return fmt.Errorf("%w: chain broken at height %d — previous_block=%s, prev indep_hash=%s",
+				ErrIndepHashMismatch,
+				block.Height,
+				block.PreviousBlock.Base64()[:16],
+				prevBlock.IndepHash.Base64()[:16])
+		}
 	}
-
-	write(block.Nonce)
-	write(block.PreviousBlock.Base64())
-	write(fmt.Sprintf("%d", block.Timestamp))
-	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff.String())
-	write(fmt.Sprintf("%d", block.Height))
-	write(block.HashListMerkle.Base64())
-	write(block.WalletList.Base64())
-	write(block.RewardAddr)
-	for _, tag := range block.Tags {
-		hasher.Write([]byte(tag.Name))
-		hasher.Write([]byte(tag.Value))
-	}
-
-	var h types.Hash
-	copy(h[:], hasher.Sum(nil))
-	return h
+	return nil
 }
 
 // validateTxRoot checks the Merkle root of transaction IDs.

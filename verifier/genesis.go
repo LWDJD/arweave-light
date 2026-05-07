@@ -2,7 +2,6 @@ package verifier
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"sync"
@@ -237,48 +236,23 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 	}, nil
 }
 
-// validateBlock performs full block validation including indep_hash verification.
+// validateBlock performs full block validation including indep_hash verification
+// via chain continuity (previous_block must equal prev block's indep_hash).
 func (gv *GenesisVerifier) validateBlock(block *types.Block, prevBlock *types.Block) error {
-	// Chain continuity and structural checks
+	// ValidateBlock checks difficulty, previous_block link, tx_root, etc.
 	if err := gv.validator.ValidateBlock(block, prevBlock); err != nil {
 		return err
 	}
 
-	// Verify IndepHash against computed hash
-	computedIndep := computeIndepHash(block)
-	if computedIndep != block.IndepHash {
-		return fmt.Errorf("indep_hash mismatch at height %d: computed %s, got %s",
-			block.Height, computedIndep.String()[:16], block.IndepHash.String()[:16])
+	// ValidateIndepHash verifies chain continuity:
+	// block.PreviousBlock == prevBlock.IndepHash
+	if err := gv.validator.ValidateIndepHash(block, prevBlock); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// computeIndepHash computes the block's independent hash per Arweave spec.
-func computeIndepHash(block *types.Block) types.Hash {
-	hasher := sha256.New()
-
-	write := func(s string) {
-		hasher.Write([]byte(s))
-	}
-
-	write(block.Nonce)
-	write(block.PreviousBlock.Base64())
-	write(fmt.Sprintf("%d", block.Timestamp))
-	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff.String())
-	write(fmt.Sprintf("%d", block.Height))
-	write(block.HashListMerkle.Base64())
-	write(block.WalletList.Base64())
-	write(block.RewardAddr)
-	for _, tag := range block.Tags {
-		hasher.Write([]byte(tag.Name))
-		hasher.Write([]byte(tag.Value))
-	}
-	hasher.Write(block.TxRoot[:])
-	hasher.Write(block.Hash[:])
-
-	var h types.Hash
-	copy(h[:], hasher.Sum(nil))
-	return h
-}
+// computeIndepHash is removed. A light node cannot recompute the indep_hash
+// for post-fork-2.6 blocks (requires internal fields not in HTTP API).
+// Use validator.ValidateIndepHash for chain-continuity verification instead.

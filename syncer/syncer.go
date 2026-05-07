@@ -9,7 +9,6 @@ package syncer
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -206,10 +205,14 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 
 	// Validate the bootstrap block
 	if s.validator != nil {
+		// For bootstrap, prevBlock is nil (no prior block to check continuity).
+		// The block's authenticity is already established by multi-peer consensus.
 		if err := s.validator.ValidateBlock(block, nil); err != nil {
 			return fmt.Errorf("validate bootstrap block %d: %w", block.Height, err)
 		}
-		if err := s.validateIndepHash(block); err != nil {
+		// ValidateIndepHash with nil prevBlock is a no-op (chain continuity
+		// cannot be checked). The consensus vote already ensures correctness.
+		if err := s.validator.ValidateIndepHash(block, nil); err != nil {
 			return fmt.Errorf("validate indep_hash: %w", err)
 		}
 	}
@@ -329,30 +332,32 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 	// ---- Incremental verification ----
 
 	// 1. Verify previous_block links to our trusted chain
+	var prevBlock *types.Block
 	if height == cp.Height+1 {
-		// Direct successor to checkpoint
-		if block.PreviousBlock != cp.BlockHash {
-			return fmt.Errorf("%w: block %d previous_block %s != trusted %s",
-				ErrForkDetected, height, block.PreviousBlock.String()[:16], cp.BlockHash.String()[:16])
+		// Direct successor to checkpoint: verify against checkpoint's indep_hash
+		if block.PreviousBlock != cp.IndepHash {
+			return fmt.Errorf("%w: block %d previous_block %s != trusted indep_hash %s",
+				ErrForkDetected, height, block.PreviousBlock.String()[:16], cp.IndepHash.String()[:16])
 		}
+		// prevBlock remains nil for ValidateIndepHash (no continuity check needed beyond above)
 	} else {
-		// Should not happen in normal catch-up (blocks are sequential)
-		// But if we skipped, get previous from DB
-		prevBlock, prevErr := s.db.GetBlockByHeight(height - 1)
-		if prevErr == nil && block.PreviousBlock != prevBlock.Hash {
+		// Get previous block from DB for chain continuity
+		var prevErr error
+		prevBlock, prevErr = s.db.GetBlockByHeight(height - 1)
+		if prevErr == nil && block.PreviousBlock != prevBlock.IndepHash {
 			return fmt.Errorf("%w: block %d previous_block mismatch", ErrForkDetected, height)
 		}
 	}
 
-	// 2. Verify block hash and tx_root via validator
+	// 2. Verify block (difficulty, tx_root) via validator
 	if s.validator != nil {
-		if err := s.validator.ValidateBlock(block, nil); err != nil {
+		if err := s.validator.ValidateBlock(block, prevBlock); err != nil {
 			return fmt.Errorf("validate block %d: %w", height, err)
 		}
 	}
 
-	// 3. Verify indep_hash
-	if err := s.validateIndepHash(block); err != nil {
+	// 3. Verify indep_hash via chain continuity
+	if err := s.validator.ValidateIndepHash(block, prevBlock); err != nil {
 		return fmt.Errorf("indep_hash block %d: %w", height, err)
 	}
 
@@ -442,15 +447,8 @@ func (s *Syncer) fetchNetworkHeight(ctx context.Context) (uint64, error) {
 	return info.Height, nil
 }
 
-// validateIndepHash verifies block.IndepHash against the computed value.
-func (s *Syncer) validateIndepHash(block *types.Block) error {
-	computed := computeIndepHash(block)
-	if computed != block.IndepHash {
-		return fmt.Errorf("indep_hash mismatch: computed %s, got %s",
-			computed.String()[:16], block.IndepHash.String()[:16])
-	}
-	return nil
-}
+// validateIndepHash is removed. Use validator.ValidateIndepHash instead,
+// which verifies chain continuity (previous_block == prev_block.indep_hash).
 
 // validateTimestamp checks that the block timestamp is not too far in the
 // future or unreasonably old relative to the chain.
@@ -599,31 +597,7 @@ func (s *Syncer) Cancel() {
 	}
 }
 
-// computeIndepHash computes the block's independent hash per Arweave spec.
-func computeIndepHash(block *types.Block) types.Hash {
-	hasher := sha256.New()
-
-	write := func(s string) {
-		hasher.Write([]byte(s))
-	}
-
-	write(block.Nonce)
-	write(block.PreviousBlock.Base64())
-	write(fmt.Sprintf("%d", block.Timestamp))
-	write(fmt.Sprintf("%d", block.LastRetarget))
-	write(block.Diff.String())
-	write(fmt.Sprintf("%d", block.Height))
-	write(block.HashListMerkle.Base64())
-	write(block.WalletList.Base64())
-	write(block.RewardAddr)
-	for _, tag := range block.Tags {
-		hasher.Write([]byte(tag.Name))
-		hasher.Write([]byte(tag.Value))
-	}
-	hasher.Write(block.TxRoot[:])
-	hasher.Write(block.Hash[:])
-
-	var h types.Hash
-	copy(h[:], hasher.Sum(nil))
-	return h
-}
+// computeIndepHash is removed. A light node cannot independently recompute
+// the indep_hash for post-fork-2.6 blocks because it requires internal fields
+// (nonce_limiter_info, signature, etc.) not available via the HTTP API.
+// Chain continuity validation (ValidateIndepHash) replaces this check.

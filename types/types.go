@@ -199,6 +199,7 @@ type Block struct {
 	Height         uint64     `json:"height"`
 	Hash           Hash       `json:"hash"`
 	IndepHash      Hash       `json:"indep_hash"`
+	Signature      string     `json:"signature,omitempty"`
 	Txs            []Hash     `json:"txs"`
 	TxRoot         Hash       `json:"tx_root"`
 	WalletList     Hash       `json:"wallet_list"`
