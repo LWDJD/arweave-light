@@ -208,6 +208,17 @@ func (s *Store) Get(url string) *types.Peer {
 	return s.urlIndex[NormalizePeerURL(url)]
 }
 
+// GetScore returns the credit score of a peer, or 0 if the peer is unknown.
+// This is used by the weighted-voting consensus in MultiClient.
+func (s *Store) GetScore(url string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.urlIndex[NormalizePeerURL(url)]; ok {
+		return p.Score
+	}
+	return 0
+}
+
 // GetAll returns a copy of all peers.
 func (s *Store) GetAll() types.PeerList {
 	s.mu.RLock()

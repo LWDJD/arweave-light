@@ -242,6 +242,12 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 }
 
 // catchUp syncs from checkpoint+1 to the current network tip.
+//
+// Safety: the checkpoint is a one-way ratchet. Once established, only blocks
+// that chain-link to it (via previous_block == indep_hash continuity) are
+// accepted. If the network reports a different chain head, we log a warning
+// but do NOT auto-switch — the user must explicitly re-verify with
+// --genesis-verify to establish a new checkpoint.
 func (s *Syncer) catchUp(ctx context.Context) error {
 	cp := s.Checkpoint()
 	if cp == nil {
@@ -252,6 +258,16 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 	targetHeight, err := s.fetchNetworkHeight(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch network height: %w", err)
+	}
+
+	// If network reports a height behind our checkpoint, the remote may be
+	// on a fork or still syncing. We do NOT roll back our trusted checkpoint.
+	if targetHeight < currentHeight {
+		s.log.Warn("Network height (%d) is behind checkpoint (%d) — "+
+			"possible remote fork or reorg. Keeping trusted checkpoint; "+
+			"run --genesis-verify to re-establish.", targetHeight, currentHeight)
+		s.updateStatus(false, currentHeight, currentHeight)
+		return nil
 	}
 
 	if currentHeight >= targetHeight {
@@ -303,6 +319,16 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 
 // verifyAndStoreBlock fetches a block at the given height, verifies it
 // incrementally against the current checkpoint, and advances the checkpoint.
+//
+// This is the core security boundary:
+//   - A block is ONLY accepted if it chain-links to the trusted checkpoint
+//     (previous_block == checkpoint.indep_hash for checkpoint+1, or
+//     previous_block == stored_block.indep_hash for subsequent blocks).
+//   - Consensus voting is used to select which block to fetch, but consensus
+//     failure alone does NOT cause a rollback of the local checkpoint.
+//   - If no block at the given height can chain-link, an ErrForkDetected is
+//     returned and syncing stops — the user must run --genesis-verify to
+//     re-establish trust on the canonical fork.
 func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 	cp := s.Checkpoint()
 	if cp == nil {
@@ -406,6 +432,14 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 			targetHeight, err := s.fetchNetworkHeight(ctx)
 			if err != nil {
 				s.log.Warn("Poll: failed to get network height: %v", err)
+				continue
+			}
+
+			// Safety: if network reports a height behind our checkpoint,
+			// do NOT roll back. The remote may be on a fork.
+			if targetHeight < cp.Height {
+				s.log.Warn("Poll: network height (%d) behind checkpoint (%d) — "+
+					"possible remote fork. Skipping this poll cycle.", targetHeight, cp.Height)
 				continue
 			}
 

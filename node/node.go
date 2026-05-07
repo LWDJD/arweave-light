@@ -36,6 +36,20 @@ type Config struct {
 	MinConsensus int  // minimum agreeing peers for consensus
 }
 
+// TrustedSeeds is a list of known stable Arweave peer addresses compiled
+// into the binary. These are used to bootstrap the peer pool on first run,
+// reducing reliance on a single bootstrap peer (e.g. arweave.net).
+//
+// Selected for long uptime and geographic diversity. Updated periodically.
+var TrustedSeeds = []string{
+	"https://arweave.net",
+}
+
+// TrustedSeedScore is the initial score assigned to trusted seed nodes.
+// This gives them higher voting weight from the start, as they are
+// pre-vetted stable nodes.
+const TrustedSeedScore = 3
+
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
@@ -264,6 +278,11 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 		return fmt.Errorf("load peers: %w", err)
 	}
 
+	// Always add trusted seeds on first start (score 0 means not yet connected)
+	if n.peerStore.Len() == 0 || !n.hasTrustedSeeds() {
+		n.addTrustedSeeds()
+	}
+
 	// Bootstrap if we have no peers OR fewer than required for consensus
 	if n.peerStore.Len() == 0 || n.peerStore.Len() < n.cfg.MinConsensus {
 		n.log.Info("Too few peers (%d < %d), bootstrapping...", n.peerStore.Len(), n.cfg.MinConsensus)
@@ -275,6 +294,29 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 	n.log.Info("Loaded %d peers from %s", n.peerStore.Len(),
 		filepath.Join(n.cfg.DataDir, "peers.json"))
 	return nil
+}
+
+// hasTrustedSeeds checks if any trusted seed is already in the peer store.
+func (n *Node) hasTrustedSeeds() bool {
+	for _, seed := range TrustedSeeds {
+		if n.peerStore.Get(seed) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// addTrustedSeeds adds compiled-in trusted seed nodes with elevated initial scores.
+func (n *Node) addTrustedSeeds() {
+	for _, seed := range TrustedSeeds {
+		p, isNew := n.peerStore.Add(seed)
+		if isNew && p != nil {
+			// Give trusted seeds a higher initial score so they carry more
+			// voting weight from the start.
+			p.Score = TrustedSeedScore
+			n.log.Info("Added trusted seed: %s (initial score=%d)", seed, TrustedSeedScore)
+		}
+	}
 }
 
 // bootstrap connects to a bootstrap peer to discover other peers.
