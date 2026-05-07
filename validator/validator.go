@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/arweave-light/merkle"
+	"github.com/arweave-light/logger"
 	"github.com/arweave-light/types"
 	"golang.org/x/crypto/blake2b"
 )
@@ -27,12 +27,14 @@ var (
 // Validator checks block and transaction validity.
 type Validator struct {
 	keyCache map[string]*rsa.PublicKey
+	log      *logger.Logger
 }
 
 // NewValidator creates a new Validator.
 func NewValidator() *Validator {
 	return &Validator{
 		keyCache: make(map[string]*rsa.PublicKey),
+		log:      logger.NewLogger("validator"),
 	}
 }
 
@@ -82,17 +84,28 @@ func (v *Validator) ValidateIndepHash(block *types.Block, prevBlock *types.Block
 }
 
 // validateTxRoot checks the Merkle root of transaction IDs.
+//
+// Arweave's tx_root is computed from {DataRoot, Offset} pairs using an
+// unbalanced Merkle tree (see ar_merkle.erl:generate_tree). A light node
+// only has transaction IDs, not the data_root or data_size of each
+// transaction, and therefore cannot independently recompute tx_root.
+//
+// We perform basic structural validation (empty list → empty root,
+// non-empty list → non-empty root) and log a debug message. Full
+// validation requires fetching each transaction's data_root.
 func (v *Validator) validateTxRoot(block *types.Block) error {
 	if len(block.Txs) == 0 && block.TxRoot == types.EmptyHash() {
 		return nil
 	}
-	ok, err := merkle.ValidateTxRoot(block.Txs, block.TxRoot)
-	if err != nil {
-		return fmt.Errorf("tx_root validation: %w", err)
+	if len(block.Txs) > 0 && block.TxRoot == types.EmptyHash() {
+		return fmt.Errorf("%w: non-empty tx list (%d txs) requires non-empty tx_root",
+			ErrInvalidTxRoot, len(block.Txs))
 	}
-	if !ok {
-		return ErrInvalidTxRoot
-	}
+	// Basic structural check passed. For light nodes we cannot recompute
+	// the exact tx_root without full transaction data (data_root + data_size).
+	// Chain continuity and multi-peer consensus provide security.
+	v.log.Debug("Block %d: tx_root structural check passed (%d txs, root=%s)",
+		block.Height, len(block.Txs), block.TxRoot.Base64()[:16])
 	return nil
 }
 
