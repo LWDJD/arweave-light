@@ -1,7 +1,7 @@
 // Package syncer implements the pure-decentralized sync strategy:
 //
-//   - First boot: multi-peer vote on latest block → trusted checkpoint {height, indep_hash}
-//   - Subsequent runs: incremental verification from checkpoint forward
+//   - First boot: consensus vote on latest block → trusted checkpoint {height, indep_hash}
+//   - Subsequent runs: multi-peer fetch (no voting) + local chain continuity verification
 //   - No arweave.net dependency as trusted source
 //   - No historical block download — chain continuity proves safety
 //   - At most 100 block headers cached in memory
@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
@@ -324,10 +325,14 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 //   - A block is ONLY accepted if it chain-links to the trusted checkpoint
 //     (previous_block == checkpoint.indep_hash for checkpoint+1, or
 //     previous_block == stored_block.indep_hash for subsequent blocks).
-//   - After bootstrap, blocks are fetched directly from a single peer.
-//     Security comes from chain verification (previous_block continuity),
-//     not from multi-peer consensus. Consensus voting is ONLY used during
-//     bootstrap to find the honest chain head.
+//   - Blocks are fetched from multiple random peers in parallel (no voting).
+//     If peers disagree on the block data, the canonical block is chosen
+//     by smallest indep_hash (per Arweave protocol: smaller hash = more
+//     work = canonical). Chain continuity verification is the final
+//     arbiter — if the chosen block fails to chain-link, syncing stops
+//     with ErrForkDetected.
+//   - Consensus voting is ONLY used during bootstrap to find the honest
+//     chain head. It is NOT used for incremental sync.
 //   - If no block at the given height can chain-link, an ErrForkDetected is
 //     returned and syncing stops — the user must run --genesis-verify to
 //     re-establish trust on the canonical fork.
@@ -337,11 +342,11 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 		return errors.New("syncer: no checkpoint")
 	}
 
-	// Fetch block directly from a single peer.
-	// After bootstrap, chain verification (previous_block continuity +
-	// indep_hash validation) provides all necessary security guarantees.
-	// Multi-peer consensus is NOT used here — it's a bootstrap-only tool.
-	block, err := s.fetchBlockFromPeer(ctx, height)
+	// Fetch block from multiple random peers without voting.
+	// Chain continuity (previous_block linking) provides security.
+	// If peers disagree, the canonical block (smallest indep_hash)
+	// is used — chain continuity will catch any truly invalid block.
+	block, err := s.fetchBlockFromMultiplePeers(ctx, height)
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", height, err)
 	}
@@ -454,53 +459,196 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 	}
 }
 
-// fetchNetworkHeight gets the current network height.
-// After bootstrap, this fetches directly from a single peer — chain
-// verification handles security, not multi-peer consensus.
+// fetchNetworkHeight gets the current network height from multiple random
+// peers without voting. Returns the majority height, or falls back to the
+// configured single peer if all multi-peer attempts fail.
 func (s *Syncer) fetchNetworkHeight(ctx context.Context) (uint64, error) {
-	// Try single peer first (typically arweave.net)
+	if s.mc.PeerStore().Len() > 0 {
+		height, err := s.fetchHeightFromMultiplePeers(ctx)
+		if err == nil {
+			return height, nil
+		}
+		s.log.Info("Multi-peer height fetch failed: %v — falling back to single peer", err)
+	}
+
 	info, err := s.sp.GetInfo(ctx)
-	if err == nil {
-		return info.Height, nil
+	if err != nil {
+		return 0, fmt.Errorf("get network height: %w", err)
+	}
+	return info.Height, nil
+}
+
+// fetchHeightFromMultiplePeers fetches the network height from multiple random
+// peers without voting. Returns the majority height, or an error if all peers fail.
+func (s *Syncer) fetchHeightFromMultiplePeers(ctx context.Context) (uint64, error) {
+	peers := s.mc.PeerStore().Random(5)
+	if len(peers) == 0 {
+		return 0, ErrNoPeers
 	}
 
-	// Fallback: try the best peer from the peer store
-	if s.mc.PeerStore().Len() > 0 {
-		peers := s.mc.PeerStore().Top(3)
-		for _, p := range peers {
-			info, err = s.mc.SingleClient(p.URL).GetInfo(ctx)
-			if err == nil {
-				return info.Height, nil
+	type fetchResult struct {
+		height uint64
+		url    string
+		err    error
+	}
+
+	results := make(chan fetchResult, len(peers))
+	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	for _, p := range peers {
+		go func(url string) {
+			info, err := s.mc.SingleClient(url).GetInfo(fetchCtx)
+			if err != nil {
+				results <- fetchResult{url: url, err: err}
+			} else {
+				results <- fetchResult{height: info.Height, url: url}
+			}
+		}(p.URL)
+	}
+
+	// Count heights
+	heightCounts := make(map[uint64]int)
+	var lastErr error
+	var responded int
+
+	for i := 0; i < len(peers); i++ {
+		r := <-results
+		if r.err != nil {
+			s.mc.PeerStore().RecordTimeout(r.url)
+			lastErr = r.err
+			continue
+		}
+		responded++
+		heightCounts[r.height]++
+		s.mc.PeerStore().RecordSuccess(r.url)
+	}
+
+	if responded == 0 {
+		return 0, fmt.Errorf("height fetch: all %d peers failed, last error: %w", len(peers), lastErr)
+	}
+
+	// Find majority height
+	var bestHeight uint64
+	var bestCount int
+	for h, c := range heightCounts {
+		if c > bestCount {
+			bestHeight = h
+			bestCount = c
+		}
+	}
+
+	if len(heightCounts) > 1 {
+		s.log.Warn("Network height disagreement: heights=%v (using %d with %d/%d peers)",
+			heightCounts, bestHeight, bestCount, responded)
+	}
+
+	return bestHeight, nil
+}
+
+// fetchBlockFromMultiplePeers fetches a block from multiple random peers
+// without consensus voting. Local chain continuity validation is the final
+// arbiter of correctness.
+//
+// It selects up to 5 random peers from the peer store, requests the block
+// in parallel, and collects all unique responses. If multiple distinct blocks
+// are returned, the one with the smallest indep_hash (i.e. hardest to mine)
+// is chosen as canonical per Arweave protocol rules. If all peers fail, the
+// configured single peer is used as fallback.
+//
+// Peer disagreements are logged but do not affect selection — the canonical
+// block is determined by indep_hash comparison, not majority count.
+func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64) (*types.Block, error) {
+	peers := s.mc.PeerStore().Random(5)
+	if len(peers) == 0 {
+		return s.sp.GetBlockByHeight(ctx, height)
+	}
+
+	type fetchResult struct {
+		block *types.Block
+		url   string
+		err   error
+	}
+
+	results := make(chan fetchResult, len(peers))
+	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	for _, p := range peers {
+		go func(url string) {
+			block, err := s.mc.SingleClient(url).GetBlockByHeight(fetchCtx, height)
+			results <- fetchResult{block: block, url: url, err: err}
+		}(p.URL)
+	}
+
+	// Collect all unique blocks
+	type blockEntry struct {
+		block *types.Block
+		urls  []string
+	}
+	byHash := make(map[string]*blockEntry)
+	var responded int
+
+	for i := 0; i < len(peers); i++ {
+		r := <-results
+		if r.err != nil {
+			s.log.Warn("Peer %s failed to fetch block %d: %v", r.url, height, r.err)
+			s.mc.PeerStore().RecordTimeout(r.url)
+			continue
+		}
+		responded++
+		s.mc.PeerStore().RecordSuccess(r.url)
+		hashKey := r.block.Hash.Base64()
+		if e, ok := byHash[hashKey]; ok {
+			e.urls = append(e.urls, r.url)
+		} else {
+			byHash[hashKey] = &blockEntry{
+				block: r.block,
+				urls:  []string{r.url},
 			}
 		}
 	}
 
-	return 0, fmt.Errorf("get network height: %w", err)
-}
-
-// fetchBlockFromPeer fetches a block from a single peer (no consensus).
-// Tries the best peer from the peer store first, then falls back to the
-// configured single peer (sp). This is used post-bootstrap — chain
-// verification handles all security, so we just need any honest peer.
-func (s *Syncer) fetchBlockFromPeer(ctx context.Context, height uint64) (*types.Block, error) {
-	// Try best peers from the peer store first
-	if s.mc.PeerStore().Len() > 0 {
-		peers := s.mc.PeerStore().Top(3)
-		for _, p := range peers {
-			block, err := s.mc.SingleClient(p.URL).GetBlockByHeight(ctx, height)
-			if err == nil {
-				return block, nil
-			}
-			s.log.Debug("Peer %s failed block %d: %v", p.URL, height, err)
-		}
+	if responded == 0 {
+		s.log.Warn("Block %d: all %d peers failed, falling back to single peer", height, len(peers))
+		return s.sp.GetBlockByHeight(ctx, height)
 	}
 
-	// Fallback to the configured single peer (typically arweave.net)
-	return s.sp.GetBlockByHeight(ctx, height)
+	// Collect unique blocks and pick canonical (smallest indep_hash)
+	var candidates []*types.Block
+	for _, e := range byHash {
+		candidates = append(candidates, e.block)
+	}
+
+	picked := pickCanonicalBlock(candidates)
+
+	if len(candidates) > 1 {
+		s.log.Warn("Block %d: %d different versions from %d responding peers "+
+			"(canonical: %s) — relying on chain continuity to resolve",
+			height, len(candidates), responded, picked.Hash.Base64()[:16])
+	}
+
+	return picked, nil
 }
 
-// validateIndepHash is removed. Use validator.ValidateIndepHash instead,
-// which verifies chain continuity (previous_block == prev_block.indep_hash).
+// pickCanonicalBlock selects the block with the smallest indep_hash value.
+// In Arweave's consensus, a smaller indep_hash represents more work (hash < diff),
+// making it the canonical block when multiple valid candidates exist.
+func pickCanonicalBlock(blocks []*types.Block) *types.Block {
+	if len(blocks) == 0 {
+		return nil
+	}
+	best := blocks[0]
+	bestInt := new(big.Int).SetBytes(best.IndepHash[:])
+	for _, b := range blocks[1:] {
+		cur := new(big.Int).SetBytes(b.IndepHash[:])
+		if cur.Cmp(bestInt) < 0 {
+			best = b
+			bestInt = cur
+		}
+	}
+	return best
+}
 
 // validateTimestamp checks that the block timestamp is not too far in the
 // future or unreasonably old relative to the chain.
