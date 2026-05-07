@@ -547,13 +547,13 @@ func (s *Syncer) fetchHeightFromMultiplePeers(ctx context.Context) (uint64, erro
 }
 
 // fetchBlockFromMultiplePeers fetches a block from multiple random peers
-// without consensus voting. Local chain continuity and heaviest-chain rules
-// are the final arbiters of correctness.
+// without voting. Local chain continuity validation is the final arbiter
+// of correctness.
 //
 // It selects up to 5 random peers from the peer store, requests the block
 // in parallel, and collects all unique responses. If multiple distinct blocks
-// are returned, the one with the highest cumulative_diff (heaviest chain per
-// Arweave protocol) is selected as canonical. If all peers fail, the
+// are returned, the one with the highest cumulative_diff is chosen as
+// canonical per Arweave's heaviest-chain rule. If all peers fail, the
 // configured single peer is used as fallback.
 func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64) (*types.Block, error) {
 	peers := s.mc.PeerStore().Random(5)
@@ -578,13 +578,8 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		}(p.URL)
 	}
 
-	// Collect unique blocks, track unique count per hash for logging
-	type uniqueBlock struct {
-		block  *types.Block
-		count  int
-		source string // first peer URL for debug
-	}
-	byHash := make(map[string]*uniqueBlock)
+	// Collect unique blocks (deduplicated by block hash)
+	byHash := make(map[string]*types.Block)
 	var responded int
 
 	for i := 0; i < len(peers); i++ {
@@ -597,14 +592,8 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		responded++
 		s.mc.PeerStore().RecordSuccess(r.url)
 		hashKey := r.block.Hash.Base64()
-		if ub, ok := byHash[hashKey]; ok {
-			ub.count++
-		} else {
-			byHash[hashKey] = &uniqueBlock{
-				block:  r.block,
-				count:  1,
-				source: r.url,
-			}
+		if _, ok := byHash[hashKey]; !ok {
+			byHash[hashKey] = r.block
 		}
 	}
 
@@ -613,28 +602,42 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		return s.sp.GetBlockByHeight(ctx, height)
 	}
 
-	// Select canonical block: highest cumulative_diff (heaviest chain rule)
-	var best *uniqueBlock
-	for _, ub := range byHash {
-		if best == nil {
-			best = ub
-			continue
-		}
-		// Compare cumulative_diff — higher = heavier = canonical
-		bestCDiff, _ := new(big.Int).SetString(string(best.block.CumulativeDiff), 10)
-		curCDiff, _ := new(big.Int).SetString(string(ub.block.CumulativeDiff), 10)
+	// Build slice of unique blocks
+	blocks := make([]*types.Block, 0, len(byHash))
+	for _, b := range byHash {
+		blocks = append(blocks, b)
+	}
+
+	if len(blocks) > 1 {
+		s.log.Warn("Block %d: %d different versions from %d responding peers — "+
+			"choosing heaviest by cumulative_diff", height, len(blocks), responded)
+	}
+
+	return pickCanonicalBlock(blocks), nil
+}
+
+// pickCanonicalBlock selects the canonical block from conflicting blocks
+// at the same height using the heaviest chain rule: the block with the
+// highest cumulative_diff wins (per Arweave protocol).
+// If cumulative_diff values are equal, the first block is returned
+// (caller should use peer-count tiebreaking when needed).
+func pickCanonicalBlock(blocks []*types.Block) *types.Block {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	best := blocks[0]
+	bestCDiff := best.CumulativeDiffBig()
+
+	for _, b := range blocks[1:] {
+		curCDiff := b.CumulativeDiffBig()
 		if curCDiff != nil && (bestCDiff == nil || curCDiff.Cmp(bestCDiff) > 0) {
-			best = ub
+			best = b
+			bestCDiff = curCDiff
 		}
 	}
 
-	if len(byHash) > 1 {
-		s.log.Warn("Block %d: %d different versions from %d responding peers "+
-			"(chosen by highest cumulative_diff) — source peer: %s",
-			height, len(byHash), responded, best.source)
-	}
-
-	return best.block, nil
+	return best
 }
 
 // validateTimestamp checks that the block timestamp is not too far in the

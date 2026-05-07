@@ -234,6 +234,18 @@ func (b *Block) Header() BlockHeader {
 	}
 }
 
+// DiffBig returns the block difficulty as a *big.Int.
+func (b *Block) DiffBig() *big.Int {
+	n, _ := BigIntFromString(string(b.Diff))
+	return n
+}
+
+// CumulativeDiffBig returns the cumulative difficulty as a *big.Int.
+func (b *Block) CumulativeDiffBig() *big.Int {
+	n, _ := BigIntFromString(string(b.CumulativeDiff))
+	return n
+}
+
 // BigIntFromString parses a decimal string into *big.Int.
 func BigIntFromString(s string) (*big.Int, error) {
 	n := new(big.Int)
