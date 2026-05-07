@@ -24,10 +24,8 @@
 - [x] Weighted consensus voting (by credibility score)
 - [x] Hardcoded trusted seed peers (compiled-in, elevated initial score)
 - [x] Checkpoint-based trust (no consensus override on fork)
-
-### 🔄 In Progress (Pro working on)
-- [ ] Independent peer discovery loop (separate goroutine, every 10s)
-- [ ] Security level system (--security low|high, ratio-based consensus)
+- [x] Independent peer discovery loop (separate goroutine, 10s interval, random peers)
+- [x] Security level system (--security low|high, ratio-based consensus)
 
 ### 📋 Planned
 - [ ] Proper error handling & crash recovery
