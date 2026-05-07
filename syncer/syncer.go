@@ -184,7 +184,7 @@ func (s *Syncer) bootstrapCheckpoint(ctx context.Context) error {
 	if s.cfg.ConsensusMode && s.mc.PeerStore().Len() > 0 {
 		block, err = s.voter.VoteLatestBlock(ctx)
 		if err != nil {
-			s.log.Warn("Consensus bootstrap failed: %v — falling back to single peer", err)
+			s.log.Info("Consensus bootstrap failed: %v — falling back to single peer", err)
 			// Fall through to single-peer
 		}
 	}
@@ -437,7 +437,7 @@ func (s *Syncer) fetchNetworkHeight(ctx context.Context) (uint64, error) {
 		if err == nil {
 			return info.Height, nil
 		}
-		s.log.Warn("Consensus GetInfo failed: %v — falling back to single peer", err)
+		s.log.Info("Consensus GetInfo failed: %v — falling back to single peer", err)
 	}
 
 	info, err := s.sp.GetInfo(ctx)

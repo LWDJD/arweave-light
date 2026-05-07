@@ -39,7 +39,7 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		DataDir:        "./arweave-light-data",
+		DataDir:        "./ar-data",
 		PeerURL:        "https://arweave.net",
 		HTTPTimeout:    30 * time.Second,
 		SyncEnabled:    true,
@@ -108,6 +108,12 @@ func New(cfg Config) (*Node, error) {
 	peersPath := filepath.Join(cfg.DataDir, "peers.json")
 	n.peerStore = peers.NewStore(peersPath)
 	n.peerStore.SetLogger(logger.NewLogger("peers"))
+
+	// Load persisted peers so query-mode commands (--info, etc.) can use them
+	// without needing to call Start(). The Load() method handles missing files gracefully.
+	if err := n.peerStore.Load(); err != nil {
+		n.log.Warn("Failed to load peers from %s: %v", peersPath, err)
+	}
 
 	// Keep single-peer client for fallback queries (height-only, no data trust)
 	n.singlePeer = client.NewHTTPClient(cfg.PeerURL, cfg.HTTPTimeout)
@@ -181,6 +187,24 @@ func (n *Node) Start(ctx context.Context) error {
 		n.peerStore.Save()
 	}
 
+	// If we still have too few peers after bootstrap, immediately try to refresh
+	if n.peerStore.Len() < n.cfg.MinConsensus*2 {
+		go func() {
+			time.Sleep(2 * time.Second) // wait for bootstrap peers to stabilize
+			n.log.Info("Attempting immediate peer refresh (only %d peers)", n.peerStore.Len())
+			newURLs, err := n.mc.GetPeersFromAll(ctx)
+			if err != nil {
+				n.log.Warn("Immediate peer refresh failed: %v", err)
+				return
+			}
+			added := n.peerStore.AddPeers(newURLs)
+			if added > 0 {
+				n.log.Info("Immediate refresh: added %d new peers (total: %d)", added, n.peerStore.Len())
+				n.peerStore.Save()
+			}
+		}()
+	}
+
 	// ---- Load persisted checkpoint ----
 	cp := n.loadCheckpoint()
 	if cp != nil {
@@ -240,8 +264,12 @@ func (n *Node) peerDiscovery(ctx context.Context) error {
 		return fmt.Errorf("load peers: %w", err)
 	}
 
-	if n.peerStore.Len() == 0 {
-		return n.bootstrap(ctx)
+	// Bootstrap if we have no peers OR fewer than required for consensus
+	if n.peerStore.Len() == 0 || n.peerStore.Len() < n.cfg.MinConsensus {
+		n.log.Info("Too few peers (%d < %d), bootstrapping...", n.peerStore.Len(), n.cfg.MinConsensus)
+		if err := n.bootstrap(ctx); err != nil {
+			n.log.Warn("Bootstrap failed: %v", err)
+		}
 	}
 
 	n.log.Info("Loaded %d peers from %s", n.peerStore.Len(),
