@@ -324,8 +324,10 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 //   - A block is ONLY accepted if it chain-links to the trusted checkpoint
 //     (previous_block == checkpoint.indep_hash for checkpoint+1, or
 //     previous_block == stored_block.indep_hash for subsequent blocks).
-//   - Consensus voting is used to select which block to fetch, but consensus
-//     failure alone does NOT cause a rollback of the local checkpoint.
+//   - After bootstrap, blocks are fetched directly from a single peer.
+//     Security comes from chain verification (previous_block continuity),
+//     not from multi-peer consensus. Consensus voting is ONLY used during
+//     bootstrap to find the honest chain head.
 //   - If no block at the given height can chain-link, an ErrForkDetected is
 //     returned and syncing stops — the user must run --genesis-verify to
 //     re-establish trust on the canonical fork.
@@ -335,24 +337,13 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 		return errors.New("syncer: no checkpoint")
 	}
 
-	var block *types.Block
-	var err error
-
-	// Fetch block — use consensus if enabled, else single peer
-	if s.cfg.ConsensusMode && s.mc.PeerStore().Len() > 0 {
-		cr, crErr := s.mc.GetBlockByHeight(ctx, height)
-		if crErr != nil {
-			s.log.Warn("Consensus fetch block %d failed: %v — trying single peer", height, crErr)
-		} else {
-			block = cr.Block
-		}
-	}
-
-	if block == nil {
-		block, err = s.sp.GetBlockByHeight(ctx, height)
-		if err != nil {
-			return fmt.Errorf("fetch block %d: %w", height, err)
-		}
+	// Fetch block directly from a single peer.
+	// After bootstrap, chain verification (previous_block continuity +
+	// indep_hash validation) provides all necessary security guarantees.
+	// Multi-peer consensus is NOT used here — it's a bootstrap-only tool.
+	block, err := s.fetchBlockFromPeer(ctx, height)
+	if err != nil {
+		return fmt.Errorf("fetch block %d: %w", height, err)
 	}
 
 	// ---- Incremental verification ----
@@ -464,21 +455,48 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 }
 
 // fetchNetworkHeight gets the current network height.
-// Uses multi-peer consensus if available, falls back to single peer.
+// After bootstrap, this fetches directly from a single peer — chain
+// verification handles security, not multi-peer consensus.
 func (s *Syncer) fetchNetworkHeight(ctx context.Context) (uint64, error) {
-	if s.cfg.ConsensusMode && s.mc.PeerStore().Len() > 0 {
-		info, err := s.mc.GetInfo(ctx)
-		if err == nil {
-			return info.Height, nil
-		}
-		s.log.Info("Consensus GetInfo failed: %v — falling back to single peer", err)
+	// Try single peer first (typically arweave.net)
+	info, err := s.sp.GetInfo(ctx)
+	if err == nil {
+		return info.Height, nil
 	}
 
-	info, err := s.sp.GetInfo(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("get network height: %w", err)
+	// Fallback: try the best peer from the peer store
+	if s.mc.PeerStore().Len() > 0 {
+		peers := s.mc.PeerStore().Top(3)
+		for _, p := range peers {
+			info, err = s.mc.SingleClient(p.URL).GetInfo(ctx)
+			if err == nil {
+				return info.Height, nil
+			}
+		}
 	}
-	return info.Height, nil
+
+	return 0, fmt.Errorf("get network height: %w", err)
+}
+
+// fetchBlockFromPeer fetches a block from a single peer (no consensus).
+// Tries the best peer from the peer store first, then falls back to the
+// configured single peer (sp). This is used post-bootstrap — chain
+// verification handles all security, so we just need any honest peer.
+func (s *Syncer) fetchBlockFromPeer(ctx context.Context, height uint64) (*types.Block, error) {
+	// Try best peers from the peer store first
+	if s.mc.PeerStore().Len() > 0 {
+		peers := s.mc.PeerStore().Top(3)
+		for _, p := range peers {
+			block, err := s.mc.SingleClient(p.URL).GetBlockByHeight(ctx, height)
+			if err == nil {
+				return block, nil
+			}
+			s.log.Debug("Peer %s failed block %d: %v", p.URL, height, err)
+		}
+	}
+
+	// Fallback to the configured single peer (typically arweave.net)
+	return s.sp.GetBlockByHeight(ctx, height)
 }
 
 // validateIndepHash is removed. Use validator.ValidateIndepHash instead,

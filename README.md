@@ -22,8 +22,8 @@ arweave-light/
 ## Design Principles
 
 1. **Pure decentralized** - No hardcoded dependency on arweave.net after initial bootstrap
-2. **Multi-peer consensus** - Cross-validate data from multiple peers before accepting
-3. **Chain continuity** - Security comes from previous_block chain, not PoW/VDF verification
+2. **Consensus only for bootstrap** - Multi-peer voting used once to find chain tip; after that, sequential block verification via `previous_block` chain
+3. **Chain continuity** - Security comes from `previous_block` chain and `hash_list_merkle`, not PoW/VDF verification
 4. **Credibility scoring** - Peers are rated by reliability; weighted voting prevents Sybil attacks
 
 ## Quick Start
@@ -47,10 +47,16 @@ See [docs/usage.md](docs/usage.md) for complete documentation.
 ## Security Model
 
 ```
-Layer 1: Consensus Voting     → Find chain tip (weighted by peer score)
-Layer 2: Chain Continuity     → Verify previous_block links
-Layer 3: VDF Timelock         → Physical impossibility of fake chain
+Bootstrap Phase (one-time):
+  Layer 1: Consensus Voting     → Find chain tip (weighted by peer score)
+
+Post-Bootstrap (every block):
+  Layer 2: Chain Continuity     → Verify previous_block links (每块验证)
+  Layer 3: hash_list_merkle     → Cross-check historical block inclusion (随机抽查)
+  Layer 4: VDF Timelock         → Physical impossibility of fake chain
 ```
+
+**核心原则**：多节点共识只用于第一次启动时的链头发现。之后每个块必须通过 `previous_block` 链逐块验证，不再依赖共识投票做安全决策。每个 Arweave 块都包含 `hash_list_merkle`——所有历史块 `indep_hash` 的 Merkle 根，可用做随机抽查验证。
 
 See [docs/security.md](docs/security.md) for details.
 

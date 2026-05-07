@@ -57,3 +57,5 @@
 | 2026-05-07 | Weighted consensus voting | Credit-score-based weighting prevents Sybil attacks; >51% ratio required |
 | 2026-05-07 | Trusted seed nodes compiled in | Reduces bootstrap reliance on single arweave.net, seeds get elevated score |
 | 2026-05-07 | Checkpoint trust is one-way ratchet | Once established, fork detection logs warning but doesn't auto-rollback |
+| 2026-05-07 | **共识只用于首次 bootstrap** | 每个块含 `hash_list_merkle`（所有历史块 hash 的 Merkle 根），首次共识找到链头后，后续**逐块验证** `previous_block` 链连续性，不再需要共识投票做安全决策 |
+| 2026-05-07 | `hash_list_merkle` 验证 | 利用每个块里的历史 Merkle 根做随机抽查验证，增强链连续性之外的第二层安全保障 |
