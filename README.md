@@ -56,6 +56,8 @@ Post-Bootstrap (every block):
   Layer 4: VDF Timelock         → Physical impossibility of fake chain
 ```
 
+**Fork Choice Rule**：当从多个节点获取到同一高度不同区块时，选择 **`cumulative_diff` 最高的块**（heaviest chain）。Arweave 的累计难度计算为 `cumulative_diff = prev.cumulative_diff + MAX_DIFF / (MAX_DIFF - block.diff)`，代表该链上累积的总工作量。**不是**简单多数投票，也**不是**最小 indep_hash。
+
 **核心原则**：多节点共识只用于第一次启动时的链头发现。之后每个块必须通过 `previous_block` 链逐块验证，不再依赖共识投票做安全决策。每个 Arweave 块都包含 `hash_list_merkle`——所有历史块 `indep_hash` 的 Merkle 根，可用做随机抽查验证。
 
 See [docs/security.md](docs/security.md) for details.
