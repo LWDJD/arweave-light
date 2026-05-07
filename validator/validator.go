@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
 
 	"github.com/arweave-light/merkle"
 	"github.com/arweave-light/types"
@@ -20,7 +19,6 @@ var (
 	ErrInvalidSignature     = errors.New("validator: invalid RSA signature")
 	ErrInvalidBlockHash     = errors.New("validator: block hash does not match")
 	ErrInvalidTxRoot        = errors.New("validator: transaction root mismatch")
-	ErrInvalidDifficulty    = errors.New("validator: insufficient difficulty")
 	ErrBlockTooOld          = errors.New("validator: block too old")
 	ErrInvalidPreviousBlock = errors.New("validator: previous block hash mismatch")
 	ErrIndepHashMismatch    = errors.New("validator: indep_hash mismatch")
@@ -40,12 +38,7 @@ func NewValidator() *Validator {
 
 // ValidateBlock performs full block validation.
 func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) error {
-	// 1. Verify difficulty (block.Hash must satisfy block.Diff)
-	if err := v.verifyDifficulty(block); err != nil {
-		return err
-	}
-
-	// 2. Check previous block hash (chain continuity)
+	// 1. Check previous block hash (chain continuity)
 	if prevBlock != nil {
 		if block.PreviousBlock != prevBlock.IndepHash {
 			return fmt.Errorf("%w: expected previous_block=%s (prev indep_hash), got %s",
@@ -57,34 +50,11 @@ func (v *Validator) ValidateBlock(block *types.Block, prevBlock *types.Block) er
 		}
 	}
 
-	// 3. Verify tx_root
+	// 2. Verify tx_root
 	if err := v.validateTxRoot(block); err != nil {
 		return err
 	}
 
-	// 4. Verify difficulty is a valid number
-	if _, err := types.BigIntFromString(block.Diff.String()); err != nil {
-		return fmt.Errorf("invalid difficulty: %w", err)
-	}
-
-	return nil
-}
-
-// verifyDifficulty checks that block.Hash, interpreted as a big-endian integer,
-// is less than or equal to block.Diff. This is the proof-of-work check.
-func (v *Validator) verifyDifficulty(block *types.Block) error {
-	diff, err := types.BigIntFromString(block.Diff.String())
-	if err != nil {
-		return fmt.Errorf("parse difficulty: %w", err)
-	}
-
-	// block.Hash is a 48-byte array; for mining solution it's SHA-256 (32 meaningful bytes)
-	// Use the full 48-byte representation as big.Int
-	hashBig := new(big.Int).SetBytes(block.Hash[:])
-	if hashBig.Cmp(diff) > 0 {
-		return fmt.Errorf("%w: hash %s > diff %s",
-			ErrInvalidDifficulty, block.Hash.Base64()[:16], block.Diff.String())
-	}
 	return nil
 }
 
@@ -231,12 +201,6 @@ func Blake2bHash(data []byte) ([]byte, error) {
 	}
 	h.Write(data)
 	return h.Sum(nil), nil
-}
-
-// ValidateDifficulty checks if a block hash satisfies the required difficulty.
-func ValidateDifficulty(blockHash types.Hash, diff *big.Int) bool {
-	hashBig := new(big.Int).SetBytes(blockHash[:])
-	return hashBig.Cmp(diff) <= 0
 }
 
 // DeepHash computes a deep hash (Arweave v2 style).

@@ -239,7 +239,7 @@ func (gv *GenesisVerifier) Verify(ctx context.Context, startFrom uint64, toHeigh
 // validateBlock performs full block validation including indep_hash verification
 // via chain continuity (previous_block must equal prev block's indep_hash).
 func (gv *GenesisVerifier) validateBlock(block *types.Block, prevBlock *types.Block) error {
-	// ValidateBlock checks difficulty, previous_block link, tx_root, etc.
+	// ValidateBlock checks previous_block link, tx_root, etc.
 	if err := gv.validator.ValidateBlock(block, prevBlock); err != nil {
 		return err
 	}

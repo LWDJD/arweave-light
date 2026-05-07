@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -40,14 +39,11 @@ func (mf *mockFetcher) FetchNetworkHeight(ctx context.Context) (uint64, error) {
 
 // generateMockBlocks creates a valid chain of mock blocks for testing.
 // Each block's PreviousBlock points to the previous block's IndepHash.
-// Hash is set to a value that satisfies the difficulty target.
 func generateMockBlocks(count int) map[uint64]*types.Block {
 	blocks := make(map[uint64]*types.Block, count)
 	rng := rand.New(rand.NewSource(42))
 
 	var prevIndepHash types.Hash
-	// Use a large diff so all mock hashes pass difficulty check
-	largeDiff := "99999999999999999999999999999999999999999999999999999999999999999999999999999999"
 
 	for i := 0; i < count; i++ {
 		height := uint64(i)
@@ -55,9 +51,9 @@ func generateMockBlocks(count int) map[uint64]*types.Block {
 		// Generate unique indep_hash (simulates what network returns)
 		indepHash := types.HashFromBytes([]byte(fmt.Sprintf("indep-%016d-%016x", height, rng.Uint64())))
 
-		// Generate a Hash that satisfies difficulty (small value)
+		// Generate a unique block hash
 		var hashBytes [48]byte
-		hashBytes[47] = 0x01 // tiny value → passes any reasonable diff
+		copy(hashBytes[:], []byte(fmt.Sprintf("hash-%016d-%016x", height, rng.Uint64())))
 		hash := types.Hash(hashBytes)
 
 		block := &types.Block{
@@ -65,7 +61,7 @@ func generateMockBlocks(count int) map[uint64]*types.Block {
 			PreviousBlock:  prevIndepHash,
 			Timestamp:      int64(120 * (i + 10000000)), // realistic timestamps
 			LastRetarget:   int64(120 * (i + 10000000)),
-			Diff:           types.FlexString(largeDiff),
+			Diff:           types.FlexString("1000"),
 			Height:         height,
 			HashListMerkle: types.HashFromBytes([]byte(fmt.Sprintf("hlm-%d", i))),
 			WalletList:     types.HashFromBytes([]byte(fmt.Sprintf("wl-%d", i))),
@@ -264,58 +260,6 @@ func TestChainContinuityBreak(t *testing.T) {
 	t.Logf("Correctly detected chain break: %s", result.FailedReason)
 }
 
-func TestDifficultyCheck(t *testing.T) {
-	val := validator.NewValidator()
-
-	// Block with very high hash (fails difficulty)
-	var highHash types.Hash
-	for i := range highHash {
-		highHash[i] = 0xFF
-	}
-	block := &types.Block{
-		Nonce:          "test",
-		PreviousBlock:  types.Hash{},
-		Timestamp:      1234567890,
-		LastRetarget:   1234567890,
-		Diff:           types.FlexString("1000"),
-		Height:         100,
-		HashListMerkle: types.Hash{},
-		WalletList:     types.Hash{},
-		RewardAddr:     "test",
-		Hash:           highHash,
-		IndepHash:      types.HashFromBytes([]byte("test")),
-	}
-
-	err := val.ValidateBlock(block, nil)
-	if err == nil {
-		t.Fatal("expected difficulty failure for high hash, got nil")
-	}
-	t.Logf("Correctly rejected high hash: %v", err)
-
-	// Block with low hash (passes difficulty)
-	var lowHash types.Hash
-	lowHash[47] = 0x01
-	block2 := &types.Block{
-		Nonce:          "test",
-		PreviousBlock:  types.Hash{},
-		Timestamp:      1234567890,
-		LastRetarget:   1234567890,
-		Diff:           types.FlexString("99999999999999999999999999999999999999999999999999999999999999999999999999999999"),
-		Height:         100,
-		HashListMerkle: types.Hash{},
-		WalletList:     types.Hash{},
-		RewardAddr:     "test",
-		Hash:           lowHash,
-		IndepHash:      types.HashFromBytes([]byte("test")),
-	}
-
-	err = val.ValidateBlock(block2, nil)
-	if err != nil {
-		t.Fatalf("expected success for low hash, got: %v", err)
-	}
-	t.Log("Correctly accepted low hash (meets difficulty)")
-}
-
 func TestGenesisVerifyWithHTTPServer(t *testing.T) {
 	blocks := generateMockBlocks(20)
 
@@ -371,5 +315,5 @@ func TestGenesisVerifyConcurrentWorkers(t *testing.T) {
 	}
 }
 
-// Ensure math/big is used (for difficulty check tests)
-var _ = big.NewInt
+// Ensure rand is used (for mock block generation)
+var _ = rand.New

@@ -349,7 +349,7 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 		}
 	}
 
-	// 2. Verify block (difficulty, tx_root) via validator
+	// 2. Verify block (tx_root, chain continuity) via validator
 	if s.validator != nil {
 		if err := s.validator.ValidateBlock(block, prevBlock); err != nil {
 			return fmt.Errorf("validate block %d: %w", height, err)
