@@ -20,12 +20,14 @@
 - [x] Peer discovery on low peer count
 - [x] Immediate peer refresh after startup
 
+### ✅ Done (v0.3.6)
+- [x] Weighted consensus voting (by credibility score)
+- [x] Hardcoded trusted seed peers (compiled-in, elevated initial score)
+- [x] Checkpoint-based trust (no consensus override on fork)
+
 ### 🔄 In Progress (Pro working on)
 - [ ] Independent peer discovery loop (separate goroutine, every 10s)
 - [ ] Security level system (--security low|high, ratio-based consensus)
-- [ ] Weighted consensus voting (by credibility score)
-- [ ] Hardcoded trusted seed peers
-- [ ] Checkpoint-based trust (no consensus override)
 
 ### 📋 Planned
 - [ ] Proper error handling & crash recovery
@@ -54,3 +56,6 @@
 | 2026-05-07 | tx_root validation = structural only | Light node lacks data_root/offset info to fully verify |
 | 2026-05-07 | Peer discovery as independent goroutine | Need continuous refresh, not tied to sync cycle |
 | 2026-05-07 | Security levels (low/high) replace min-consensus | More flexible, ratio-based instead of fixed number |
+| 2026-05-07 | Weighted consensus voting | Credit-score-based weighting prevents Sybil attacks; >51% ratio required |
+| 2026-05-07 | Trusted seed nodes compiled in | Reduces bootstrap reliance on single arweave.net, seeds get elevated score |
+| 2026-05-07 | Checkpoint trust is one-way ratchet | Once established, fork detection logs warning but doesn't auto-rollback |
