@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"sync"
 	"time"
 
@@ -344,8 +343,8 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 
 	// Fetch block from multiple random peers without voting.
 	// Chain continuity (previous_block linking) provides security.
-	// If peers disagree, the canonical block (smallest indep_hash)
-	// is used — chain continuity will catch any truly invalid block.
+	// If peers disagree, the majority block is used and a warning is
+	// logged — chain continuity will catch any truly invalid block.
 	block, err := s.fetchBlockFromMultiplePeers(ctx, height)
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", height, err)
@@ -556,8 +555,19 @@ func (s *Syncer) fetchHeightFromMultiplePeers(ctx context.Context) (uint64, erro
 // is chosen as canonical per Arweave protocol rules. If all peers fail, the
 // configured single peer is used as fallback.
 //
-// Peer disagreements are logged but do not affect selection — the canonical
-// block is determined by indep_hash comparison, not majority count.
+// fetchBlockFromMultiplePeers fetches a block from multiple random peers
+// without voting. Local chain continuity validation is the final arbiter
+// of correctness.
+//
+// It selects up to 5 random peers from the peer store, requests the block
+// in parallel, and groups results by block hash. The block with the most
+// matching responses (majority) is returned. If all peers fail, the
+// configured single peer is used as fallback.
+//
+// If peers disagree on the block hash, a warning is logged but the
+// majority block is still returned — the caller's chain continuity check
+// in verifyAndStoreBlock will detect and reject any block that doesn't
+// chain-link to the trusted checkpoint.
 func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64) (*types.Block, error) {
 	peers := s.mc.PeerStore().Random(5)
 	if len(peers) == 0 {
@@ -581,12 +591,13 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		}(p.URL)
 	}
 
-	// Collect all unique blocks
-	type blockEntry struct {
+	// Group by block hash
+	type hashGroup struct {
 		block *types.Block
 		urls  []string
+		count int
 	}
-	byHash := make(map[string]*blockEntry)
+	byHash := make(map[string]*hashGroup)
 	var responded int
 
 	for i := 0; i < len(peers); i++ {
@@ -599,12 +610,14 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		responded++
 		s.mc.PeerStore().RecordSuccess(r.url)
 		hashKey := r.block.Hash.Base64()
-		if e, ok := byHash[hashKey]; ok {
-			e.urls = append(e.urls, r.url)
+		if g, ok := byHash[hashKey]; ok {
+			g.urls = append(g.urls, r.url)
+			g.count++
 		} else {
-			byHash[hashKey] = &blockEntry{
+			byHash[hashKey] = &hashGroup{
 				block: r.block,
 				urls:  []string{r.url},
+				count: 1,
 			}
 		}
 	}
@@ -614,40 +627,21 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		return s.sp.GetBlockByHeight(ctx, height)
 	}
 
-	// Collect unique blocks and pick canonical (smallest indep_hash)
-	var candidates []*types.Block
-	for _, e := range byHash {
-		candidates = append(candidates, e.block)
-	}
-
-	picked := pickCanonicalBlock(candidates)
-
-	if len(candidates) > 1 {
-		s.log.Warn("Block %d: %d different versions from %d responding peers "+
-			"(canonical: %s) — relying on chain continuity to resolve",
-			height, len(candidates), responded, picked.Hash.Base64()[:16])
-	}
-
-	return picked, nil
-}
-
-// pickCanonicalBlock selects the block with the smallest indep_hash value.
-// In Arweave's consensus, a smaller indep_hash represents more work (hash < diff),
-// making it the canonical block when multiple valid candidates exist.
-func pickCanonicalBlock(blocks []*types.Block) *types.Block {
-	if len(blocks) == 0 {
-		return nil
-	}
-	best := blocks[0]
-	bestInt := new(big.Int).SetBytes(best.IndepHash[:])
-	for _, b := range blocks[1:] {
-		cur := new(big.Int).SetBytes(b.IndepHash[:])
-		if cur.Cmp(bestInt) < 0 {
-			best = b
-			bestInt = cur
+	// Find majority block
+	var best *hashGroup
+	for _, g := range byHash {
+		if best == nil || g.count > best.count {
+			best = g
 		}
 	}
-	return best
+
+	if len(byHash) > 1 {
+		s.log.Warn("Block %d: %d different versions from %d responding peers "+
+			"(majority: %d/%d) — relying on chain continuity to resolve",
+			height, len(byHash), responded, best.count, responded)
+	}
+
+	return best.block, nil
 }
 
 // validateTimestamp checks that the block timestamp is not too far in the
