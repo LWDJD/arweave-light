@@ -287,8 +287,19 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 		default:
 		}
 
-		if err := s.verifyAndStoreBlock(ctx, h); err != nil {
-			return fmt.Errorf("verify block %d: %w", h, err)
+		err := s.verifyAndStoreBlock(ctx, h)
+		if err != nil {
+			if errors.Is(err, ErrForkDetected) {
+				s.log.Warn("Fork detected at height %d during catch-up, attempting auto-recovery...", h)
+				if recoverErr := s.handleFork(ctx, h); recoverErr != nil {
+					s.log.Error("Fork recovery failed: %v", recoverErr)
+					return fmt.Errorf("verify block %d: %w", h, err)
+				}
+				// Recovery succeeded, restart from new checkpoint
+				h = s.Checkpoint().Height // will be incremented to forkPoint+1 by loop
+			} else {
+				return fmt.Errorf("verify block %d: %w", h, err)
+			}
 		}
 
 		// Update status every 10 blocks
@@ -408,6 +419,65 @@ func (s *Syncer) verifyAndStoreBlock(ctx context.Context, height uint64) error {
 	return nil
 }
 
+// handleFork is called when verifyAndStoreBlock detects a fork at failedHeight.
+// It walks back from failedHeight to find the common ancestor, deletes blocks
+// above it, and re-syncs from there.
+func (s *Syncer) handleFork(ctx context.Context, failedHeight uint64) error {
+	s.log.Warn("Fork detected at height %d, attempting rollback...", failedHeight)
+
+	// Walk backwards from failedHeight to find common ancestor
+	for h := failedHeight; h > 0; h-- {
+		// Fetch this height's block from multiple peers
+		block, err := s.fetchBlockFromMultiplePeers(ctx, h)
+		if err != nil {
+			s.log.Warn("Fork recovery: cannot fetch block %d: %v", h, err)
+			continue
+		}
+
+		if h == 1 {
+			// Genesis block, no previous to check
+			continue
+		}
+
+		// Get expected previous block from our local store
+		prevFromStore, storeErr := s.db.GetBlockByHeight(h - 1)
+		if storeErr != nil {
+			// We don't have this block locally, keep walking back
+			continue
+		}
+
+		// If the peer's block chains to our stored block, we found the fork point
+		if block.PreviousBlock == prevFromStore.IndepHash {
+			s.log.Info("Fork recovery: common ancestor at height %d (indep_hash=%s)",
+				h-1, prevFromStore.IndepHash.String()[:16])
+
+			// Delete all blocks above the common ancestor
+			if err := s.db.DeleteBlocksAbove(h - 1); err != nil {
+				return fmt.Errorf("fork recovery: delete blocks: %w", err)
+			}
+
+			// Reset checkpoint to common ancestor
+			newCP := &TrustedCheckpoint{
+				Height:     h - 1,
+				IndepHash: prevFromStore.IndepHash,
+				BlockHash:  prevFromStore.Hash,
+				Timestamp:  prevFromStore.Timestamp,
+			}
+			s.setCheckpoint(newCP)
+
+			s.log.Info("Fork recovery: rolled back to height %d, re-syncing...", h-1)
+			return nil // Caller should re-sync from checkpoint
+		}
+
+		// If the peer's block chains to a different block than what we have stored,
+		// keep walking back
+		s.log.Debug("Fork recovery: height %d chains to %s (expected %s)",
+			h, block.PreviousBlock.String()[:16], prevFromStore.IndepHash.String()[:16])
+	}
+
+	return fmt.Errorf("fork recovery: could not find common ancestor within local store")
+}
+
 // pollLoop periodically checks for new blocks.
 func (s *Syncer) pollLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.PollInterval)
@@ -445,9 +515,20 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 			s.updateStatus(true, cp.Height, targetHeight)
 
 			for h := cp.Height + 1; h <= targetHeight; h++ {
-				if err := s.verifyAndStoreBlock(ctx, h); err != nil {
-					s.log.Error("Poll sync error at height %d: %v", h, err)
-					break
+				err := s.verifyAndStoreBlock(ctx, h)
+				if err != nil {
+					if errors.Is(err, ErrForkDetected) {
+						s.log.Warn("Fork detected at height %d, attempting auto-recovery...", h)
+						if recoverErr := s.handleFork(ctx, h); recoverErr != nil {
+							s.log.Error("Fork recovery failed: %v", recoverErr)
+							break
+						}
+						// Recovery succeeded, restart from new checkpoint
+						h = s.Checkpoint().Height // will be incremented to forkPoint+1 by loop
+					} else {
+						s.log.Error("Poll sync error at height %d: %v", h, err)
+						break
+					}
 				}
 			}
 
