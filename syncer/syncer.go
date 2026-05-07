@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
@@ -546,28 +547,14 @@ func (s *Syncer) fetchHeightFromMultiplePeers(ctx context.Context) (uint64, erro
 }
 
 // fetchBlockFromMultiplePeers fetches a block from multiple random peers
-// without consensus voting. Local chain continuity validation is the final
-// arbiter of correctness.
+// without consensus voting. Local chain continuity and heaviest-chain rules
+// are the final arbiters of correctness.
 //
 // It selects up to 5 random peers from the peer store, requests the block
 // in parallel, and collects all unique responses. If multiple distinct blocks
-// are returned, the one with the smallest indep_hash (i.e. hardest to mine)
-// is chosen as canonical per Arweave protocol rules. If all peers fail, the
+// are returned, the one with the highest cumulative_diff (heaviest chain per
+// Arweave protocol) is selected as canonical. If all peers fail, the
 // configured single peer is used as fallback.
-//
-// fetchBlockFromMultiplePeers fetches a block from multiple random peers
-// without voting. Local chain continuity validation is the final arbiter
-// of correctness.
-//
-// It selects up to 5 random peers from the peer store, requests the block
-// in parallel, and groups results by block hash. The block with the most
-// matching responses (majority) is returned. If all peers fail, the
-// configured single peer is used as fallback.
-//
-// If peers disagree on the block hash, a warning is logged but the
-// majority block is still returned — the caller's chain continuity check
-// in verifyAndStoreBlock will detect and reject any block that doesn't
-// chain-link to the trusted checkpoint.
 func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64) (*types.Block, error) {
 	peers := s.mc.PeerStore().Random(5)
 	if len(peers) == 0 {
@@ -591,13 +578,13 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		}(p.URL)
 	}
 
-	// Group by block hash
-	type hashGroup struct {
-		block *types.Block
-		urls  []string
-		count int
+	// Collect unique blocks, track unique count per hash for logging
+	type uniqueBlock struct {
+		block  *types.Block
+		count  int
+		source string // first peer URL for debug
 	}
-	byHash := make(map[string]*hashGroup)
+	byHash := make(map[string]*uniqueBlock)
 	var responded int
 
 	for i := 0; i < len(peers); i++ {
@@ -610,14 +597,13 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		responded++
 		s.mc.PeerStore().RecordSuccess(r.url)
 		hashKey := r.block.Hash.Base64()
-		if g, ok := byHash[hashKey]; ok {
-			g.urls = append(g.urls, r.url)
-			g.count++
+		if ub, ok := byHash[hashKey]; ok {
+			ub.count++
 		} else {
-			byHash[hashKey] = &hashGroup{
-				block: r.block,
-				urls:  []string{r.url},
-				count: 1,
+			byHash[hashKey] = &uniqueBlock{
+				block:  r.block,
+				count:  1,
+				source: r.url,
 			}
 		}
 	}
@@ -627,18 +613,25 @@ func (s *Syncer) fetchBlockFromMultiplePeers(ctx context.Context, height uint64)
 		return s.sp.GetBlockByHeight(ctx, height)
 	}
 
-	// Find majority block
-	var best *hashGroup
-	for _, g := range byHash {
-		if best == nil || g.count > best.count {
-			best = g
+	// Select canonical block: highest cumulative_diff (heaviest chain rule)
+	var best *uniqueBlock
+	for _, ub := range byHash {
+		if best == nil {
+			best = ub
+			continue
+		}
+		// Compare cumulative_diff — higher = heavier = canonical
+		bestCDiff, _ := new(big.Int).SetString(string(best.block.CumulativeDiff), 10)
+		curCDiff, _ := new(big.Int).SetString(string(ub.block.CumulativeDiff), 10)
+		if curCDiff != nil && (bestCDiff == nil || curCDiff.Cmp(bestCDiff) > 0) {
+			best = ub
 		}
 	}
 
 	if len(byHash) > 1 {
 		s.log.Warn("Block %d: %d different versions from %d responding peers "+
-			"(majority: %d/%d) — relying on chain continuity to resolve",
-			height, len(byHash), responded, best.count, responded)
+			"(chosen by highest cumulative_diff) — source peer: %s",
+			height, len(byHash), responded, best.source)
 	}
 
 	return best.block, nil
