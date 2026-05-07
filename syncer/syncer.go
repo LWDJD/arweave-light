@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"sync"
 	"time"
 
@@ -327,10 +326,9 @@ func (s *Syncer) catchUp(ctx context.Context) error {
 //     previous_block == stored_block.indep_hash for subsequent blocks).
 //   - Blocks are fetched from multiple random peers in parallel (no voting).
 //     If peers disagree on the block data, the canonical block is chosen
-//     by smallest indep_hash (per Arweave protocol: smaller hash = more
-//     work = canonical). Chain continuity verification is the final
-//     arbiter — if the chosen block fails to chain-link, syncing stops
-//     with ErrForkDetected.
+//     by highest cumulative_diff (heaviest chain rule per Arweave protocol).
+//     Chain continuity verification is the final arbiter — if the chosen
+//     block fails to chain-link, syncing stops with ErrForkDetected.
 //   - Consensus voting is ONLY used during bootstrap to find the honest
 //     chain head. It is NOT used for incremental sync.
 //   - If no block at the given height can chain-link, an ErrForkDetected is
